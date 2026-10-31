@@ -19,7 +19,7 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_utils import HardwareClassification, requires_cuda
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
-from torch.utils._triton import has_triton, has_triton_package
+from torch.utils._triton import has_triton_package
 
 
 aten = torch.ops.aten
@@ -275,15 +275,33 @@ class TestCompilerBisector(TestCase):
                 get_env_val.cache_clear()
 
 
-def _triton_available_for(device: str) -> bool:
-    # Per-device view; has_triton() is an any-device aggregate.
-    interface = get_interface_for_device(device.split(":")[0])
-    return interface.is_available() and interface.is_triton_capable()
+def _triton_available_for(device: str | torch.device) -> bool:
+    # Per-device parity with has_triton(); the aggregate is any-device.
+    if not has_triton_package() or config.triton_disable_device_detection:
+        return False
+    try:
+        interface = get_interface_for_device(torch.device(device).type)
+    except NotImplementedError:
+        return False
+    if not (interface.is_available() and interface.is_triton_capable()):
+        return False
+    from torch._dynamo.exc import TritonUnavailableError
+
+    try:
+        interface.raise_if_triton_unavailable()
+    except TritonUnavailableError:
+        return False
+    return True
 
 
 @unittest.skipIf(not has_triton(), "requires Triton")
 class TestCompilerBisectorDevice(TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
+
+    def setUp(self):
+        if not _triton_available_for(self.device_type):
+            self.skipTest(f"requires Triton on {self.device_type}")
+        super().setUp()
 
     def test_bisect_run_debuginfo(self, device):
         import os
@@ -339,7 +357,6 @@ class TestCompilerBisectorDevice(TestCase):
         self.assertEqual(out.bisect_number, 2)
         self.assertTrue("relu" in out.debug_info)
 
-    @unittest.skipIf(not has_triton_package(), "requires Triton")
     @config.patch(
         {
             "test_configs.bisect_pre_grad_graph": True,
@@ -347,9 +364,6 @@ class TestCompilerBisectorDevice(TestCase):
         }
     )
     def test_bisect_pre_grad_graph(self, device):
-        if not _triton_available_for(device):
-            self.skipTest(f"requires Triton on {device}")
-
         def f(x):
             for _ in range(5):
                 x = x + 1
