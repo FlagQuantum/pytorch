@@ -261,17 +261,25 @@ class MultiKernel:
         for ws in self.kernels[0].args.workspace_args:
             V.graph.wrapper_code.generate_workspace_allocation(ws)
 
+        inductor_meta = (
+            {"asserts_need_real_inputs": True}
+            if any(kernel.asserts_need_real_inputs for kernel in self.kernels)
+            else None
+        )
         if V.graph.cpp_wrapper:
             # We have already selected the best kernel at compile time
             # so we only have one set of call args. NB: this currently
             # doesn't work with MultiTemplateBuffer kernels. @bobrenjc93
             # will add it in a subsequent PR.
             V.graph.wrapper_code.generate_kernel_call(
-                kernel_name, call_args, arg_types=arg_types
+                kernel_name, call_args, arg_types=arg_types, inductor_meta=inductor_meta
             )
         else:
             V.graph.wrapper_code.generate_kernel_call(
-                kernel_name, multi_call_args, arg_types=multi_call_arg_types
+                kernel_name,
+                multi_call_args,
+                arg_types=multi_call_arg_types,
+                inductor_meta=inductor_meta,
             )
 
         for ws in reversed(self.kernels[0].args.workspace_args):
@@ -519,6 +527,18 @@ class MultiKernelCall:
         run = self.kernels[self.picked_kernel].run  # type: ignore[method-assign]
         filtered_args = self._get_filtered_args(args, self.picked_kernel)
         run(*filtered_args, **kwargs)
+
+    def use_first_config(self, stream):
+        """Choose a sub-kernel without benchmarking, and keep its first config.
+
+        For sub-kernels that the compile-time autotune block cannot launch on its
+        generated tensors, when the C++ wrapper needs the choice at compile time.
+        """
+        if self.picked_kernel is None:
+            self.picked_kernel = 0
+        kernel = self.kernels[self.picked_kernel]
+        kernel.use_first_config(stream)
+        self.record_choice(self.multi_kernel_name, kernel.inductor_meta["kernel_name"])
 
     def _metrics_table_row(self, timings):
         def get_kernel_path(k):

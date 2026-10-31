@@ -1053,9 +1053,10 @@ class _KernelConfigs(DeferredLineBase):
         rows = "".join(f"    {name!r}: {cfg!r},\n" for name, cfg in pinned.items())
         return (
             "# The config each kernel below launches with when this file is run on its own,\n"
-            "# chosen by autotuning at compile time. A kernel missing here autotunes on its\n"
-            "# first launch, as does one whose config does not fit the GPU (after a retry\n"
-            "# with pipelining off).\n"
+            "# chosen at compile time: by autotuning, or the first config of a kernel with a\n"
+            "# device assert that autotuning inputs could trip. A kernel missing here\n"
+            "# autotunes on its first launch, as does one whose config does not fit the GPU\n"
+            "# (after a retry with pipelining off).\n"
             f"{KERNEL_CONFIGS_NAME} = {{\n{rows}}}"
         )
 
@@ -2352,8 +2353,8 @@ class PythonWrapperCodegen(CodeGen):
         # Each module-level kernel that reads its launch config from KERNEL_CONFIGS, and
         # that config, which generate_and_run_autotune_block fills in.
         self.kernel_configs: dict[str, dict[str, Any] | None] = {}
-        # kernel_autotune_names across the root and its subgraphs: the kernels the
-        # autotune block launches.
+        # kernel_autotune_names across the root and its subgraphs: the kernels whose
+        # config the autotune block chooses.
         self.kernel_autotune_names_all_graphs: OrderedSet[str] = OrderedSet()
         self.kernel_autotune_names: OrderedSet[str] = OrderedSet()
         # Kernel argument name -> cached tensor and its lifetime/storage metadata.
@@ -3765,8 +3766,8 @@ class PythonWrapperCodegen(CodeGen):
                 exec(tuning_code, scope)
             except Exception as e:
                 raise RuntimeError(f"Failed to run autotuning code block: {e}") from e
-        # Only the kernels the block launched: async_compile precompiles every kernel,
-        # so one launcher alone does not show that it was tuned.
+        # Only the kernels whose config the block chose: async_compile precompiles
+        # every kernel, so one launcher alone does not show that a config was chosen.
         for name in self.kernel_configs.keys() & self.kernel_autotune_names_all_graphs:
             kernel = scope.get(name)
             if isinstance(kernel, CachingAutotuner) and len(kernel.launchers) == 1:
@@ -5656,10 +5657,32 @@ class PythonWrapperCodegen(CodeGen):
 
         self.write_triton_header_once()
 
-        if (
+        autotune_in_block = (
             config.triton.autotune_at_compile_time
             and kernel_name not in self.kernel_autotune_names
+        )
+        if (
+            autotune_in_block
+            and inductor_meta
+            and inductor_meta.get("asserts_need_real_inputs")
         ):
+            # The block runs kernels on generated tensors, which need not hold
+            # what the asserts check (an index computed from zeros can be out of
+            # range), and a failed device assert leaves the device unusable. So
+            # the kernel keeps its first config: the C++ wrapper needs its binary
+            # now, and a Python module launches it from KERNEL_CONFIGS, because a
+            # precompiled module must not tune when it runs. A multi-kernel has no
+            # row and picks its sub-kernel at its first launch, which is why
+            # precompile turns multi-kernels off.
+            log.info(
+                "Skipping compile-time autotuning for kernel %s, which has device asserts.",
+                kernel_name,
+            )
+            if V.graph.cpp_wrapper or not kernel_name.startswith("multi_kernel_"):
+                self.kernel_autotune_calls.writeline(
+                    f"{kernel_name}.use_first_config(stream={stream_name})"
+                )
+        elif autotune_in_block:
             # Create example args for autotune in a separate epilogue
             if not (arg_types is not None and len(call_args) == len(arg_types)):
                 raise AssertionError("call_args and arg_types do not match")
@@ -5885,6 +5908,7 @@ class PythonWrapperCodegen(CodeGen):
                         "<del_call>",
                     )
                 )
+        if autotune_in_block:
             self.kernel_autotune_names.add(kernel_name)
             self.kernel_autotune_names_all_graphs.add(kernel_name)
             if V.graph.cpp_wrapper:
