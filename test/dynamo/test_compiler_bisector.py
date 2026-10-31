@@ -18,7 +18,7 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_utils import HardwareClassification, requires_cuda
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
-from torch.utils._triton import has_triton_for_device
+from torch.utils._triton import has_triton, has_triton_for_device
 
 
 aten = torch.ops.aten
