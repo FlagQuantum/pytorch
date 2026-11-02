@@ -198,10 +198,16 @@ class GdsFile:
             self._async_io_events[key] = torch.cuda.Event()
         self._async_io_events[key].record(stream)
 
-    def _wait_for_current_stream(self, storage: Storage, fn_name: str) -> None:
-        # Synchronizing during capture would invalidate the caller's capture.
-        if torch.cuda.is_current_stream_capturing():
+    def _check_not_capturing(self, storage: Storage, fn_name: str) -> None:
+        # Synchronizing during capture would invalidate the caller's capture,
+        # and an event recorded during capture cannot be waited on afterwards.
+        with torch.cuda.device(storage.device):
+            capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
             raise RuntimeError(f"{fn_name} is not supported during CUDA graph capture")
+
+    def _wait_for_current_stream(self, storage: Storage, fn_name: str) -> None:
+        self._check_not_capturing(storage, fn_name)
         torch.cuda.current_stream(storage.device).synchronize()
 
     def load_storage(self, storage: Storage, offset: int = 0) -> None:
@@ -276,9 +282,12 @@ class GdsFile:
         """
         if self.handle is None:
             raise AssertionError("Cannot load data from a file that is not registered.")
-        nbytes = torch._C._gds_load_storage_async(self.handle, storage, offset)
-        self._record_async_io(storage)
-        return nbytes
+        self._check_not_capturing(storage, "load_storage_async")
+        # The load may have enqueued work even if it raises.
+        try:
+            return torch._C._gds_load_storage_async(self.handle, storage, offset)
+        finally:
+            self._record_async_io(storage)
 
     def save_storage(self, storage: Storage, offset: int = 0) -> None:
         """Saves data from the storage into the file.
@@ -352,6 +361,9 @@ class GdsFile:
         """
         if self.handle is None:
             raise AssertionError("Cannot save data to a file that is not registered.")
-        nbytes = torch._C._gds_save_storage_async(self.handle, storage, offset)
-        self._record_async_io(storage)
-        return nbytes
+        self._check_not_capturing(storage, "save_storage_async")
+        # The save may have enqueued work even if it raises.
+        try:
+            return torch._C._gds_save_storage_async(self.handle, storage, offset)
+        finally:
+            self._record_async_io(storage)

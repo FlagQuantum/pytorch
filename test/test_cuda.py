@@ -13121,6 +13121,26 @@ class TestGDS(TestCase):
             del file
             self.assertTrue(torch.cuda.current_stream().query())
 
+    def test_gds_async_deregister_waits_after_error(self):
+        # An async call that raises may still have enqueued work on the handle,
+        # so deregistering must wait for it too.
+        self._require_gds()
+        save_async = torch._C._gds_save_storage_async
+
+        def failing_save(*args):
+            save_async(*args)
+            raise RuntimeError("injected failure")
+
+        storage = torch.empty(4096, device="cuda").untyped_storage()
+        with TemporaryFileName() as f:
+            file = torch.cuda.gds.GdsFile(f, os.O_CREAT | os.O_RDWR)
+            torch.cuda._sleep(int(100 * get_cycles_per_ms()))
+            with patch.object(torch._C, "_gds_save_storage_async", failing_save):
+                with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                    file.save_storage_async(storage)
+            file.deregister_handle()
+            self.assertTrue(torch.cuda.current_stream().query())
+
     def test_gds_async_deregister_buffer_waits(self):
         # Deregistering a buffer waits for pending async I/O on it. hipFile
         # rejects deregistering a buffer with operations outstanding.
