@@ -1940,6 +1940,47 @@ class TestGridExprMaximum(TestCase):
         self.assertEqual(grid.maximum([10, 20, 5]), 20)
 
 
+class TestPrecomputedGridConfigMatching(TestCase):
+    def _make_grid(self):
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        return PrecomputedGrid(
+            inductor_meta={
+                "precomputed_grids": [
+                    {
+                        "config": {
+                            "BLOCK_EMB_1": 64,
+                            "BLOCK_EMB_2": 64,
+                            "num_warps": 8,
+                            "num_stages": 2,
+                        },
+                        "python": ["4", "1", "1"],
+                        "cpp": ["4L", "1L", "1L"],
+                        "python_slow": ["4", "1", "1"],
+                    }
+                ]
+            },
+            mode="python",
+        )
+
+    def test_matches_pipelining_disabled_retry_config(self):
+        # compile_by_disabling_pipelining retries with num_stages=1 when
+        # the chosen config exceeds shared memory; the precomputed grid
+        # (a function of sizes and BLOCK constexprs only) must still match.
+        grid = self._make_grid()
+        grid.generate(
+            {"BLOCK_EMB_1": 64, "BLOCK_EMB_2": 64, "num_warps": 8, "num_stages": 1}
+        )
+        self.assertEqual((grid.x_grid, grid.y_grid, grid.z_grid), ("4", "1", "1"))
+
+    def test_still_rejects_different_block_sizes(self):
+        grid = self._make_grid()
+        with self.assertRaises(AssertionError):
+            grid.generate(
+                {"BLOCK_EMB_1": 32, "BLOCK_EMB_2": 64, "num_warps": 8, "num_stages": 2}
+            )
+
+
 class TestGrid2DWithYZOverflowZeroYnumel(TestCase):
     """Regression test for https://github.com/pytorch/pytorch/issues/178530"""
 

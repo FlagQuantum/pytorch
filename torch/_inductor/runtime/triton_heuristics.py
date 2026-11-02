@@ -5784,7 +5784,16 @@ class FixedGrid(GridExpr):
 class PrecomputedGrid(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         for candidate in self.inductor_meta["precomputed_grids"]:
-            if all(meta.get(k) == v for k, v in candidate["config"].items()):
+            # The launch grid depends on tensor sizes and BLOCK constexprs,
+            # not on num_warps/num_stages. Excluding those two lets the
+            # pipelining-disabled retry (num_stages=1, used when the chosen
+            # config exceeds shared memory) reuse the precomputed grid
+            # instead of failing to find an exact config match.
+            if all(
+                meta.get(k) == v
+                for k, v in candidate["config"].items()
+                if k not in ("num_warps", "num_stages")
+            ):
                 self.x_grid, self.y_grid, self.z_grid = candidate[self.mode]
                 return
         raise AssertionError(
