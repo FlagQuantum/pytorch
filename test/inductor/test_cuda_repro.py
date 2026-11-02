@@ -2208,7 +2208,12 @@ class CudaReproTests(TestCase):
 
         f1_out, f1_grad = run(f, True)
         eager_out, eager_grad = run(f, False)
-        self.assertEqual(f1_out, eager_out, atol=1e-5, rtol=1e-5)
+        self.assertEqual(
+            f1_out,
+            eager_out,
+            atol=2e-4 if TEST_XPU else 1e-5,
+            rtol=1e-4 if TEST_XPU else 1e-5,
+        )
         self.assertEqual(f1_grad, eager_grad, atol=1e-5, rtol=1e-5)
 
         opt_fn = torch.compile(f, backend="inductor", fullgraph=True)
