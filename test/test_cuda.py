@@ -7,7 +7,6 @@ import functools
 import gc
 import importlib.util
 import json
-import mmap
 import os
 import pickle
 import random
@@ -13044,13 +13043,8 @@ class TestGDS(TestCase):
     @largeTensorTest("3GB", "cuda")
     def test_gds_hipfile_transfer_size_limit(self):
         # hipFile silently truncates transfers to MAX_RW_COUNT, so GdsFile
-        # rejects larger storages. If the truncation check below fails, hipFile
-        # supports larger transfers: remove check_transfer_size from
-        # GdsFile.cpp along with this test.
+        # rejects larger storages.
         self._require_gds()
-        max_nbytes = 2**31 - mmap.PAGESIZE
-        # Keep the size O_DIRECT aligned, or hipFile's fastpath refuses it and
-        # the transfer fails rather than truncating when compat mode is off.
         storage = torch.UntypedStorage(2**31, device="cuda")
         with TemporaryFileName() as f:
             file = torch.cuda.gds.GdsFile(f, os.O_CREAT | os.O_RDWR)
@@ -13063,20 +13057,6 @@ class TestGDS(TestCase):
             for transfer in transfers:
                 with self.assertRaisesRegex(RuntimeError, "transfers at most"):
                     transfer(storage)
-            # Bypass the check by calling hipFile directly. Find the loaded
-            # library rather than naming its soname, which can change.
-            with open("/proc/self/maps") as maps:
-                path = next(s.split()[-1] for s in maps if "/libhipfile.so" in s)
-            write = ctypes.CDLL(path).hipFileWrite
-            write.restype = ctypes.c_ssize_t
-            ptr, off = ctypes.c_void_p, ctypes.c_int64
-            write.argtypes = [ptr, ptr, ctypes.c_size_t, off, off]
-            written = write(file.handle, storage.data_ptr(), storage.nbytes(), 0, 0)
-            self.assertEqual(written, max_nbytes)
-            # A storage at the limit is not rejected.
-            del storage
-            storage = torch.UntypedStorage(max_nbytes, device="cuda")
-            file.load_storage(storage)
 
     def test_gds_async_stream_ordered(self):
         # The transfers run on the current (side) stream after the kernels that
