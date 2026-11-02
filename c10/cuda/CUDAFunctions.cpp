@@ -243,7 +243,9 @@ cudaError_t GetDeviceCount(int* dev_count) {
 // x = torch.empty(1, device=“cuda:1”) # no CUDA context on cuda:0 after this
 // call y = torch.empty(1, device=“cuda”) # CUDA context is created on cuda:0
 // ```
-#if CUDA_VERSION >= 12000
+// ROCm takes this path too: with HIP 7.14+ `hipSetDevice` likewise marks the
+// target device's primary context active.
+#if CUDA_VERSION >= 12000 || defined(USE_ROCM)
 thread_local static DeviceIndex targetDeviceIndex = -1;
 
 cudaError_t GetDevice(DeviceIndex* device) {
