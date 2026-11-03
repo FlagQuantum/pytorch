@@ -483,7 +483,8 @@ class OrderedDictOrderGuardTests(torch._dynamo.test_case.TestCase):
         + [("delete", 1), ("replace", 1), ("duplicate", 1)],
     )
     @parametrize("key_type", [str, int])
-    def test_ordered_dict_invalid_storage(self, mutation, linked_count, key_type):
+    @parametrize("copy", [False, True])
+    def test_ordered_dict_invalid_storage(self, mutation, linked_count, key_type, copy):
         mapping = OrderedDict()
         if mutation == "before":
             dict.__setitem__(mapping, key_type(0), 0)
@@ -506,7 +507,8 @@ class OrderedDictOrderGuardTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(root.check(mapping))
 
         def fn(x, mapping):
-            return x + 1, tuple(mapping.values()), tuple(mapping.items())
+            result = mapping.copy() if copy else mapping
+            return x + 1, tuple(result.values()), tuple(result.items())
 
         counter = CompileCounter()
         compiled = torch.compile(fn, backend=counter)
