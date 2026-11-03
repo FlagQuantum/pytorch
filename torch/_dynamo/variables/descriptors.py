@@ -595,13 +595,56 @@ class BoundBuiltinMethodVariable(VariableTracker):  # noqa: RVT001
     def python_type(self) -> type:
         return types.BuiltinMethodType
 
+    def key_hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        obj = self.obj.realize()
+        tracker = tx.output.builtin_method_keys
+        tracker.activate(tx)
+        if obj.source is not None:
+            receiver = tracker.add_receiver(tx, obj.source)
+            method = self.descriptor
+            if hasattr(method, "__get__"):
+                method = _bind_builtin_method(method, receiver)
+            return hash(method), True
+        obj_type = obj.python_type()
+        if any(obj_type is kind for kind in (list, dict, set)) and self.value is None:
+            tracker.add_receiver(tx, None)
+            # Internal bucket only: method equality still distinguishes C
+            # functions. User-visible hash() retains its escape restrictions.
+            return id(obj), True
+        # A constant receiver may alias a sourced receiver, but has no source
+        # for a relational guard. Preserve identity specialization in that case.
+        tracker.add_custom_key()
+        return self.hash_impl(tx)
+
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
         # meth_hash: https://github.com/python/cpython/blob/e76aa128fe/Objects/methodobject.c#L319
         # It hashes m_self by identity, so only a guarded runtime method has a
         # real hash; a method bound during tracing gets a compile-time-only one.
         if self.value is not None:
             return hash(self.value), False
-        return id(self), True
+        obj = self.obj.realize()
+        if obj.source:
+            # Equal-valued receivers can have different identity-based method hashes.
+            install_guard(obj.source.make_guard(GuardBuilder.ID_MATCH))
+            receiver = tx.output.resolve_source_value(obj.source)
+        else:
+            receiver = obj.get_real_python_backed_value()
+            # Container VTs may materialize copies with no runtime-stable identity.
+            if (
+                receiver is NO_SUCH_SUBOBJ
+                or receiver is not obj.get_real_python_backed_value()
+            ):
+                # A receiver-only fake hash would conflate different C functions.
+                unimplemented(
+                    gb_type="builtin method hash with unstable receiver",
+                    context=f"{self}",
+                    explanation="Dynamo cannot compute the hash of a builtin method without a stable receiver identity.",
+                    hints=[*graph_break_hints.DIFFICULT],
+                )
+        method = self.descriptor
+        if hasattr(method, "__get__"):
+            method = _bind_builtin_method(method, receiver)
+        return hash(method), True
 
     def tp_richcompare_impl(self, tx, other, op):
         # meth_richcompare: equal iff both are builtin methods with the same
