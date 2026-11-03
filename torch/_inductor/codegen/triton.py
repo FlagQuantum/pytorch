@@ -1552,7 +1552,20 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def abs(x):
+        if utils.is_strict_cuda_triton():
+            return f"triton_helpers.eager_unary_nan({x}, tl_math.abs({x}))"
         return f"tl_math.abs({x})"
+
+    @staticmethod
+    def neg(x):
+        if utils.is_strict_cuda_triton() and getattr(x, "dtype", None) in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ):
+            return f"triton_helpers.eager_unary_nan({x}, -{x})"
+        return f"-{x}"
 
     # TODO - register these ops as having divergent dtype
     # output if doing graph pass to remove consecutive casts
@@ -2366,6 +2379,7 @@ class TritonOverrides(OpOverrides):
         return f"tl.sigmoid({x})"
 
     @staticmethod
+    @maybe_upcast_float32(convert_output=False)
     # pyrefly: ignore [bad-override]
     def signbit(x):
         # x < 0 is wrong for -0.0 in floating point, so use libdevice for supported floating
@@ -2740,6 +2754,13 @@ class TritonKernelOverrides(TritonOverrides):
         V.kernel.compute.writeline(
             f"{mantissa}, {exponent} = triton_helpers.frexp({x})"
         )
+        if utils.is_strict_cuda_triton():
+            mantissa = V.kernel.cse.generate(
+                V.kernel.compute,
+                f"triton_helpers.eager_unary_nan({x}, {mantissa})",
+                dtype=x.dtype,
+                shape=x.shape,
+            )
         V.kernel.cse.put(cache_key, (mantissa, exponent))
         return (mantissa, exponent)
 
