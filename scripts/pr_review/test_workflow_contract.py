@@ -39,6 +39,7 @@ import os
 import posixpath
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -966,11 +967,11 @@ def indented_block(text: str, key: str) -> list[str]:
 def refuse_unmodelled_spellings(case: unittest.TestCase, text: str, what: str) -> None:
     """Require `text` to be written in the narrow YAML subset these readers parse.
 
-    Extracted from Stage 1's grammar test so Stage 2 and the suite CI get the
-    same fence. Round 8 closed four separate defects that were all one shape —
-    a flow mapping or a bare list marker in a file with no grammar — while
-    Stage 1, which has had this since round 5, produced none of them. A grammar
-    on one of three files is not a grammar.
+    Run on all three workflows by
+    `test_all_three_workflows_are_written_in_the_readable_subset`. A flow
+    mapping or a bare list marker is the shape of four separate defects found
+    in files that had no grammar, and none in the one that did. A grammar on
+    one of three files is not a grammar.
     """
     lines = text.split("\n")
     i = 0
@@ -1945,7 +1946,6 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
             strip_comments(self.text),
         )
 
-
     PREFLIGHT_STEP = "- name: Refuse a suppressed or emptied suite"
 
     def _preflight_entry(self) -> str:
@@ -1965,7 +1965,9 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         self.assertTrue(step.strip(), "the preflight step is gone")
         return textwrap.dedent(scalar_block(step, "run"))
 
-    def _run_preflight(self, *, hook: bool = False, delete: tuple[str, ...] = ()) -> int:
+    def _run_preflight(
+        self, *, hook: bool = False, delete: tuple[str, ...] = ()
+    ) -> int:
         """RUN it against a synthesized tree. Returns the exit status.
 
         A real subtree rather than the repository's own: the two rejections are
@@ -2222,9 +2224,10 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         """Drive `run_this_suite` with a stubbed loader/runner; return the code.
 
         Mocked because the three states below cannot all be reached by running
-        the real suite, and NOT relied on alone: the test after next runs the
-        real entry point, loader and runner, which is what keeps this stub
-        honest about the arguments `discover` is actually given.
+        the real suite, and NOT relied on alone:
+        `test_every_module_entry_point_finds_and_runs_this_suite` runs the real
+        entry point, loader and runner, which is what keeps this stub honest
+        about the arguments `discover` is actually given.
         """
         result = unittest.mock.Mock()
         result.wasSuccessful.return_value = successful
@@ -2290,48 +2293,54 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         It patches `TestLoader` and `TextTestRunner` out, and CI runs
         `unittest discover`, which imports each module as part of the package.
         So this starts every module the way `python3 scripts/pr_review/
-        test_<x>.py` does: a fresh process, a cwd that is not the repository,
-        no arguments, and the REAL `run_this_suite`, loader and runner. That
-        catches a module that only fails as a script (a relative import), a
-        `__main__` that is not `run_this_suite()`, and a path or `discover`
-        argument that finds a narrower tree. Only what discovery returns is
-        swapped, for as many sentinel tests as it found: the suite this run is
-        part of already executes every test, so each entry point only has to
-        find them all and hand every one to the runner.
+        test_<x>.py` does: its own fresh process, a cwd that is not the
+        repository, no arguments, and the REAL `run_this_suite`, loader and
+        runner. That catches a module that only fails as a script (a relative
+        or package-absolute import), a `__main__` that is not
+        `run_this_suite()`, and a path or `discover` argument that finds a
+        narrower tree. Only what discovery returns is swapped, for as many
+        sentinel tests as it found: the suite this run is part of already
+        executes every test, so each entry point only has to find them all and
+        hand every one to the runner.
+
+        A TIMEOUT, because a `__main__` that builds the suite some other way
+        (`loadTestsFromModule`, a spawned `unittest discover`) bypasses the
+        swap, reaches this test inside the child and recurses. The children run
+        sentinels only, so a short bound is enough.
         """
         program = textwrap.dedent(
             """
             import runpy, sys, unittest
-            here, expected, names = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
-            sys.path.insert(0, here)  # what starting `python3 <here>/<name>` does
+            path, expected = sys.argv[1], int(sys.argv[2])
+            sys.argv = [path]  # started with no arguments
+            sys.path.insert(0, path.rsplit("/", 1)[0])  # what script start does
             real_discover = unittest.TestLoader.discover
-            seen = {}
+            seen = {"found": None, "ran": 0}
             class Sentinel(unittest.TestCase):
                 def test_ran(self):
                     seen["ran"] += 1
             def count_then_swap(loader, *args, **kwargs):
-                seen["found"] = real_discover(loader, *args, **kwargs).countTestCases()
+                found = real_discover(loader, *args, **kwargs)
+                seen["found"] = found.countTestCases()
+                for error in loader.errors:
+                    print(error, file=sys.stderr)
                 return unittest.TestSuite(
                     Sentinel("test_ran") for _ in range(seen["found"])
                 )
             unittest.TestLoader.discover = count_then_swap
             unittest.main = lambda *a, **k: sys.exit("unittest.main() was called")
-            for name in names:
-                seen.update(found=None, ran=0)
-                sys.argv = [f"{here}/{name}"]
-                code = "returned without exiting"
-                try:
-                    runpy.run_path(f"{here}/{name}", run_name="__main__")
-                except SystemExit as e:
-                    code = e.code
-                if code != 0:
-                    sys.exit(f"{name}: {code}")
-                if seen["found"] != expected or seen["ran"] != expected:
-                    sys.exit(
-                        f"{name}: found {seen['found']} tests and ran "
-                        f"{seen['ran']}; discovery from the repository finds "
-                        f"{expected}"
-                    )
+            code = "returned without exiting"
+            try:
+                runpy.run_path(path, run_name="__main__")
+            except SystemExit as e:
+                code = e.code
+            if code != 0:
+                sys.exit(f"exit {code}")
+            if seen["found"] != expected or seen["ran"] != expected:
+                sys.exit(
+                    f"found {seen['found']} tests and ran {seen['ran']}; "
+                    f"discovery from the repository finds {expected}"
+                )
             """
         )
         expected = (
@@ -2339,15 +2348,56 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
             .discover(start_dir=str(HERE_MANIFEST.parent), top_level_dir=str(REPO))
             .countTestCases()
         )
+
+        # Each child leads its own process group, so a timeout kills whatever
+        # it spawned too; otherwise a grandchild holding stderr open keeps the
+        # drain below waiting after the child itself is dead.
+        def kill_tree(child):
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
         with tempfile.TemporaryDirectory() as td:
-            proc = subprocess.run(
-                [sys.executable, "-c", program, str(HERE_MANIFEST.parent),
-                 str(expected), *sorted(EXPECTED_MODULES)],
-                cwd=td,
-                capture_output=True,
-                text=True,
+            children = {}
+            try:
+                for name in sorted(EXPECTED_MODULES):
+                    children[name] = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            program,
+                            str(HERE_MANIFEST.parent / name),
+                            str(expected),
+                        ],
+                        cwd=td,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        start_new_session=True,
+                    )
+                failures = {}
+                for name, child in children.items():
+                    try:
+                        _, err = child.communicate(timeout=120)
+                    except subprocess.TimeoutExpired:
+                        kill_tree(child)
+                        _, err = child.communicate(timeout=10)
+                        err += "\ntimed out: the entry point recursed or hung"
+                    if child.returncode != 0:
+                        failures[name] = err[-1500:]
+            finally:
+                for child in children.values():
+                    if child.poll() is None:
+                        kill_tree(child)
+                        child.wait()
+        if failures:
+            self.fail(
+                "`python3 scripts/pr_review/<module>` does not find and run the "
+                "whole suite for: "
+                + ", ".join(failures)
+                + "".join(f"\n\n--- {name}:\n{err}" for name, err in failures.items())
             )
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
 
     def test_the_preflight_runs_before_the_suite(self):
         """It is worthless after the step whose result it is meant to qualify."""
@@ -2792,10 +2842,9 @@ class TestNoWorkflowSetsAnUnmodelledEnvironmentName(unittest.TestCase):
     each call site so a workflow added later is covered by the loop.
     """
 
-    # Stage 1 keeps its own, narrower list on
-    # `TestStage1RunsNoPullRequestContent.ALLOWED_ENV_KEYS`; that test is the
-    # one that owns Stage 1's surface, and this loop uses it rather than a
-    # second copy that could drift from it.
+    # Stage 1's narrower list is `TestStage1RunsNoPullRequestContent.
+    # ALLOWED_ENV_KEYS`, kept beside the rest of Stage 1's surface; this loop is
+    # its only reader, and uses it rather than a second copy that could drift.
     STAGE2_ENV_KEYS = frozenset(
         (
             "APPEND_SYSTEM_PROMPT",
@@ -2887,13 +2936,13 @@ class TestNoWorkflowSetsAnUnmodelledEnvironmentName(unittest.TestCase):
                 )
 
     def test_all_three_workflows_are_written_in_the_readable_subset(self):
-        """The grammar Stage 1 has had since round 5, on the other two files.
+        """The only grammar check, on all three workflows.
 
-        Round 8 closed four defects that were all one shape — a flow mapping or
-        a bare list marker somewhere no line-oriented reader models — and every
-        one was in Stage 2 or the suite CI. Stage 1, which this already
-        covered, produced none. A grammar on one of three files is not a
-        grammar, so it is applied to all three here.
+        Four defects were all one shape — a flow mapping or a bare list marker
+        somewhere no line-oriented reader models — and every one was in a file
+        without a grammar. A grammar on one of three files is not a grammar, so
+        it is applied to all three here. Comments are stripped first: Actions
+        never reads them.
         """
         for path in (STAGE1, STAGE2, SUITE_CI):
             with self.subTest(workflow=path.name):
@@ -3161,8 +3210,8 @@ class TestEveryStageTwoJobChecksOutWhatItsRoleAllows(unittest.TestCase):
         so a run the workflow is going to skip still joins it. Stage 2 receives
         a `workflow_run` completion for EVERY Stage 1 run, including the ones
         `prepare` refuses — so one group at column 0 lets a refused run cancel
-        a review already in flight. Stage 1 is pinned against this; Stage 2 was
-        not, and the reasoning transfers word for word.
+        a review already in flight. This is the only pin for either stage, and
+        the reasoning is the same for both.
         """
         for path in (STAGE1, STAGE2):
             with self.subTest(workflow=path.name):
@@ -3405,8 +3454,8 @@ class TestReviewRoleSeparationIsPinned(unittest.TestCase):
     * `environment: bedrock` + the shared role — i.e. reverting both together
       to the old interim state. Nothing fails; the untrusted job silently
       regains PutObject on `pr_review_verdicts/`, the forgery path this design
-      exists to remove. This is the dangerous one, and asserting the exact
-      expected pair below is what catches it.
+      exists to remove. This is the dangerous one, and the two tests below
+      that each pin one half of the pair are what catch it.
 
     Dropping the environment line entirely fails closed and is merely broken.
 
@@ -3452,7 +3501,6 @@ class TestReviewRoleSeparationIsPinned(unittest.TestCase):
             "declaration is the only thing that mints the OIDC `sub` the "
             "untrusted role's trust policy accepts",
         )
-
 
     def test_review_job_never_names_the_publisher_environment(self):
         """`environment: bedrock` here would hand the untrusted job the publisher's sub."""
@@ -3507,7 +3555,9 @@ class TestStage1CollapseGroupIsJobLevel(unittest.TestCase):
     with a single trigger and no stale file anywhere.
 
     So the group lives on `capture`, which a rejected run never enters, and the
-    workflow level carries none. `.github/scripts/ensure_actions_will_cancel.py`
+    workflow level carries none (pinned by
+    `test_neither_stage_declares_a_workflow_level_collapse_group`).
+    `.github/scripts/ensure_actions_will_cancel.py`
     is the reason one was kept after the ciforge incident; it selects files with
     `"pull_request" in on`, an exact key match, so this file left its scope when
     the trigger moved and the checker exits 0 without it.
@@ -3515,7 +3565,6 @@ class TestStage1CollapseGroupIsJobLevel(unittest.TestCase):
 
     def setUp(self):
         self.text = STAGE1.read_text()
-
 
     def test_capture_job_keeps_a_collapse_group(self):
         """The group must not be dropped either — bursts should still collapse."""
@@ -4059,8 +4108,6 @@ class TestStage1RunsNoPullRequestContent(unittest.TestCase):
         )
     )
 
-
-
     def test_no_step_reaches_the_network_or_evaluates_fetched_text(self):
         """Defence in depth behind the step-set pin, and it names the hazard.
 
@@ -4187,7 +4234,6 @@ class TestStage1RunsNoPullRequestContent(unittest.TestCase):
                 "to a full commit SHA. A `./local` path resolves from the "
                 "workspace and a tag can be moved by whoever owns it.",
             )
-
 
     def test_no_shell_reads_the_workspace(self):
         """Nothing is checked out there, so a read finds nothing today. It is
@@ -5034,13 +5080,9 @@ class TestSymlinkScrubIsNulSafe(unittest.TestCase):
             "escaping symlinks.",
         )
 
-
     def test_both_the_delete_and_the_rescan_read_nul_separated(self):
         self.assertEqual(self.scrub.count("printf '%s\\0'"), 1)
         self.assertEqual(self.scrub.count("read -r -d ''"), 3)
-
-
-
 
 
 class TestLabelComparisonsAreCaseInsensitive(unittest.TestCase):
@@ -6016,7 +6058,6 @@ class TestThePrCheckoutIsNotAFullClone(unittest.TestCase):
         self.assertNotIn("merge-base", self.stripped)
         self.assertNotIn("--deepen", self.stripped)
         self.assertNotIn("--unshallow", self.stripped)
-
 
     def _run_corroboration(self, merge_base: str, td: str, **identities):
         return run_corroboration(merge_base, td, **identities)
