@@ -256,6 +256,13 @@ class GdsFile:
         :meth:`deregister_handle`, and therefore deleting this object, waits
         for the load to run.
 
+        If ``storage`` was allocated on another stream, keep a reference to it
+        until that stream has waited for the load (for example with
+        :meth:`~torch.cuda.Stream.wait_stream`), or call
+        :meth:`~torch.Tensor.record_stream` with the current stream on a tensor
+        that uses it. Otherwise the CUDA caching allocator can give its memory
+        to a new allocation while the load is still pending.
+
         .. note::
             cuFile's stream APIs do not support CUDA graphs, so this raises a
             ``RuntimeError`` if called during graph capture.
@@ -334,6 +341,13 @@ class GdsFile:
         synchronize with the stream before modifying the storage or using the
         file (see :ref:`cuda-stream-semantics`). :meth:`deregister_handle`,
         and therefore deleting this object, waits for the save to run.
+
+        If ``storage`` was allocated on another stream, keep a reference to it
+        until that stream has waited for the save (for example with
+        :meth:`~torch.cuda.Stream.wait_stream`), or call
+        :meth:`~torch.Tensor.record_stream` with the current stream on a tensor
+        that uses it. Otherwise the CUDA caching allocator can give its memory
+        to a new allocation, and the save can write that allocation's data.
 
         .. note::
             cuFile's stream APIs do not support CUDA graphs, so this raises a
