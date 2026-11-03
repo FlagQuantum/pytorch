@@ -47,7 +47,7 @@ from .base import (
 )
 from .constant import ConstantVariable
 from .functions import BaseUserFunctionVariable, UserMethodVariable
-from .object_protocol import object_richcompare, python_constant_repr_impl, type_init
+from .object_protocol import object_richcompare, python_constant_repr_impl
 from .user_defined import UserDefinedObjectVariable
 
 
