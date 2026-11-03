@@ -1,4 +1,5 @@
 # Owner(s): ["module: dynamo"]
+import builtins
 import enum
 import itertools
 import operator
@@ -369,7 +370,9 @@ class DictTests(torch._dynamo.test_case.TestCase):
             self.assertIs(next(k for k in mapping if k == key), key)
         self.assertEqual(counter.frame_count, 1)
 
-    @parametrize("mapping_type", [dict, OrderedDict])
+    @parametrize(
+        "mapping_type", [dict, OrderedDict, getattr(builtins, "frozendict", dict)]
+    )
     @parametrize("operation", [operator.not_, bool, len, list])
     def test_input_keys_view_guards(self, mapping_type, operation):
         def fn(x, view):
@@ -1479,7 +1482,7 @@ class DictTests(torch._dynamo.test_case.TestCase):
 
     @parametrize(
         "mapping_type",
-        [dict, OrderedDict, defaultdict],
+        [dict, OrderedDict, defaultdict, getattr(builtins, "frozendict", dict)],
     )
     @parametrize("present", [False, True])
     def test_get_hashes_key_once(self, mapping_type, present):
@@ -3067,7 +3070,7 @@ class DictTests(torch._dynamo.test_case.TestCase):
 
     @parametrize(
         "mapping_type",
-        [dict, OrderedDict, defaultdict],
+        [dict, OrderedDict, defaultdict, getattr(builtins, "frozendict", dict)],
     )
     @parametrize("candidate", [[], ["a", 1], ("a",), ("a", 1, 2)])
     def test_items_contains_non_pair(self, mapping_type, candidate):
@@ -4761,7 +4764,7 @@ class DictTests(torch._dynamo.test_case.TestCase):
     @parametrize("custom_hash", [False, True])
     @parametrize(
         "mapping_type",
-        [dict, OrderedDict, defaultdict],
+        [dict, OrderedDict, defaultdict, getattr(builtins, "frozendict", dict)],
     )
     def test_lookup_type_errors(self, operation, custom_hash, mapping_type):
         class Key:
