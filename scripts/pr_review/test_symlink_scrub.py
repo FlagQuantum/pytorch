@@ -2,7 +2,7 @@
 """Run the symlink-scrub step's ACTUAL shell against hostile trees.
 
 The other contract tests for this step are structural — they assert that the
-YAML contains `printf '%s\\0'` and no newline-joined variable. Measured, not
+YAML contains `printf '%s\\0'` and reads it with `read -r -d ''`. Measured, not
 assumed: replacing both `scan_escaping > "$SCAN"` calls with `: > "$SCAN"`
 turns the step into a no-op that every structural assertion still passes,
 because the text they grep for is all still present. (Deleting the step

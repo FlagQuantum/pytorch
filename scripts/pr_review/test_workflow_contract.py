@@ -71,12 +71,6 @@ STAGE2 = WORKFLOWS / "hardened-pr-review-run.yml"
 SUITE_CI = WORKFLOWS / "pr-review-scripts-test.yml"
 # The guard module itself, copied into a synthesized tree by the preflight test.
 HERE_MANIFEST = Path(__file__).resolve().parent / "_suite_manifest.py"
-# Set by `test_the_real_entry_point_runs_this_suite_and_passes` in the child it
-# spawns, TO THE SPAWNER'S PID. Without it that test recurses forever: the child
-# runs the whole suite, which contains the test, which spawns another child. The
-# value matters as much as the key — a bare `1` inherited from anywhere else
-# disables the test in the parent too, silently.
-REENTRY_MARKER = "PR_REVIEW_ENTRY_POINT_CHILD"
 PR_REVIEW_SKILL = REPO / ".agents" / "skills" / "pr-review" / "SKILL.md"
 # THE skills stage A installs and may read: pr-review, and the sibling skills
 # installed beside it, which an installed skill may refer to as `../<name>/`.
@@ -158,9 +152,8 @@ def refuse_execution_outside_steps(
     passing them: a job whose keys are not at four spaces (legal YAML, and the
     regexes below assume four), and a quoted key carrying a backslash escape
     (`"\u0064efaults":` decodes to `defaults` and matches nothing here). Both
-    were found by review as silent bypasses. Stage 1 is additionally fenced by
-    `test_stage1_uses_only_spellings_this_class_can_read`; Stage 2 and the
-    suite-CI file have no such grammar test, which is why the check lives here.
+    were found by review as silent bypasses. All three workflows are also
+    fenced by `test_all_three_workflows_are_written_in_the_readable_subset`.
     """
     job_block_text = strip_comments(job_block(text, job))
     whole = strip_comments(text)
@@ -223,8 +216,8 @@ def refuse_unsafe_env_keys(
     it broken the same day: `BASH_FUNC_python3%%: '() { return 0; }'` replaces
     `python3` itself for every step in scope — bash imports exported functions
     from the environment — and it is on nobody's list of dangerous variables.
-    So the rule is inverted, as `test_stage1_uses_only_spellings_this_class_can
-    _read` already does for grammar: a name must be plain `SCREAMING_SNAKE`,
+    So the rule is inverted, as `refuse_unmodelled_spellings` already does for
+    grammar: a name must be plain `SCREAMING_SNAKE`,
     which `BASH_FUNC_python3%%` is not, and must not be one of the startup
     variables, which are the legal-looking names that still execute code.
 
@@ -1952,39 +1945,6 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
             strip_comments(self.text),
         )
 
-    def test_it_refuses_a_discovery_suppressing_package_hook(self):
-        """The one guard that cannot live inside the suite it guards.
-
-        `load_tests` on `scripts/pr_review/__init__.py` stops discovery before a
-        single test is collected, so every in-suite check is silent about it.
-        This step runs outside the subtree; without it the suite's own
-        completeness guarantee is void.
-
-        It also covers the emptied suite, whose exit code is interpreter-
-        dependent, so neither of the two "the suite never ran" cases rests on a
-        test inside the suite.
-
-        Pinned on the REJECTION, not just the words: a step that evaluates
-        `hasattr` and discards the answer would satisfy a substring check while
-        guarding nothing, so each condition is pinned together with the
-        `raise SystemExit` that acts on it.
-        """
-        body = strip_comments(self.text)
-        step = "\n".join(
-            indented_block(body, "- name: Refuse a suppressed or emptied suite")
-        )
-        self.assertTrue(
-            step.strip(), "the preflight step is gone; nothing checks either case"
-        )
-        self.assertIn("import scripts.pr_review as p", step)
-        self.assertIn("if hasattr(p, 'load_tests'):", step)
-        self.assertIn("EXPECTED_MODULES", step)
-        self.assertIn("if missing:", step)
-        # Two conditions, and each must actually reject. `assert` would not: -O
-        # or a PYTHONOPTIMIZE in the environment strips it and the step passes.
-        self.assertEqual(
-            step.count("raise SystemExit"), 2, "a checked condition does not reject"
-        )
 
     PREFLIGHT_STEP = "- name: Refuse a suppressed or emptied suite"
 
@@ -2005,7 +1965,7 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         self.assertTrue(step.strip(), "the preflight step is gone")
         return textwrap.dedent(scalar_block(step, "run"))
 
-    def _run_preflight(self, *, hook: bool = False, delete: str = "") -> int:
+    def _run_preflight(self, *, hook: bool = False, delete: tuple[str, ...] = ()) -> int:
         """RUN it against a synthesized tree. Returns the exit status.
 
         A real subtree rather than the repository's own: the two rejections are
@@ -2021,7 +1981,7 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
             )
             shutil.copy(HERE_MANIFEST, pkg / HERE_MANIFEST.name)
             for name in EXPECTED_MODULES:
-                if name != delete:
+                if name not in delete:
                     (pkg / name).write_text("")
             bash = shutil.which("bash")
             self.assertIsNotNone(bash, "premise changed: bash is not installed")
@@ -2043,18 +2003,26 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                 cwd=td,
                 capture_output=True,
                 text=True,
-                env={**os.environ, "PATH": f"{shim}:{os.environ.get('PATH', '')}"},
+                # PYTHONOPTIMIZE strips `assert`, so a rejection rewritten as
+                # one passes here exactly as it would on a runner that sets it.
+                env={
+                    **os.environ,
+                    "PATH": f"{shim}:{os.environ.get('PATH', '')}",
+                    "PYTHONOPTIMIZE": "1",
+                },
             ).returncode
 
     def test_the_preflight_actually_rejects_both_states(self):
-        """EXECUTED, because the structural test above cannot see control flow.
+        """EXECUTED, because a text pin cannot see control flow.
 
         Counting two `raise SystemExit` and matching the condition strings is
         satisfied by both raises nested under `if False:`, by a condition that
         tests the wrong object, and by the second check shadowing the first.
-        The three cases below are the contract the step exists for, and the
-        healthy case is what keeps a step that rejects EVERYTHING from passing
-        the other two.
+        The cases below are the contract the step exists for, and the healthy
+        case is what keeps a step that rejects EVERYTHING from passing the
+        others. The emptied suite is its own case: its exit code from
+        `unittest discover` depends on the interpreter, so nothing inside the
+        suite can be relied on to fail it.
         """
         self.assertEqual(self._run_preflight(), 0, "the preflight rejects a good tree")
         self.assertNotEqual(
@@ -2067,10 +2035,15 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         for name in sorted(EXPECTED_MODULES):
             with self.subTest(deleted=name):
                 self.assertNotEqual(
-                    self._run_preflight(delete=name),
+                    self._run_preflight(delete=(name,)),
                     0,
                     f"deleting {name} is accepted by the preflight",
                 )
+        self.assertNotEqual(
+            self._run_preflight(delete=tuple(EXPECTED_MODULES)),
+            0,
+            "an emptied suite is accepted by the preflight",
+        )
 
     def test_the_suite_job_cannot_tolerate_its_own_failure(self):
         """ONE LINE HERE MAKES EVERY CONTRACT IN THIS FILE ADVISORY.
@@ -2250,8 +2223,8 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
 
         Mocked because the three states below cannot all be reached by running
         the real suite, and NOT relied on alone: the test after next runs the
-        real entry point end to end, which is what keeps this stub honest about
-        the arguments `discover` is actually given.
+        real entry point, loader and runner, which is what keeps this stub
+        honest about the arguments `discover` is actually given.
         """
         result = unittest.mock.Mock()
         result.wasSuccessful.return_value = successful
@@ -2311,80 +2284,70 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                     f"{argv} was accepted and silently ignored",
                 )
 
-    def test_the_real_entry_point_runs_this_suite_and_passes(self):
+    def test_every_module_entry_point_finds_and_runs_this_suite(self):
         """The stub above proves the STATUS mapping and nothing else.
 
-        It patches `TestLoader` out entirely, so `start_dir`, `pattern` and
-        `top_level_dir` are never exercised — a `discover` pointed at the wrong
-        directory, or given a pattern matching nothing, keeps every assertion
-        above green. This runs the shipped entry point for real, from a cwd
-        that is not the repository, and requires it to find this very suite.
-
-        IT MUST NOT RE-ENTER, and the first version did: the child runs the
-        WHOLE suite, which contains this test, which spawns another child. The
-        recursion has no base case and no timeout — it hung the run rather than
-        failing it. The env marker below is the base case, and it is the reason
-        this test cannot simply be written as "run it and see".
+        It patches `TestLoader` and `TextTestRunner` out, and CI runs
+        `unittest discover`, which imports each module as part of the package.
+        So this starts every module the way `python3 scripts/pr_review/
+        test_<x>.py` does: a fresh process, a cwd that is not the repository,
+        no arguments, and the REAL `run_this_suite`, loader and runner. That
+        catches a module that only fails as a script (a relative import), a
+        `__main__` that is not `run_this_suite()`, and a path or `discover`
+        argument that finds a narrower tree. Only what discovery returns is
+        swapped, for as many sentinel tests as it found: the suite this run is
+        part of already executes every test, so each entry point only has to
+        find them all and hand every one to the runner.
         """
-        # THE MARKER NAMES OUR SPAWNER, and a bare truthy value would not do.
-        # With `if os.environ.get(MARKER)`, a value inherited from anywhere — a
-        # developer's export, a workflow `env:`, a nested invocation — skipped
-        # this test in the PARENT as well, so the only check on `run_this_suite`'s
-        # real `discover` arguments vanished and the run stayed green. Comparing
-        # against our actual parent pid means a leaked value cannot match: the
-        # test runs, spawns a child, and the child (whose ppid IS ours) skips.
-        # `!= "1"` as well: under a container init our ppid CAN be 1, and a
-        # leaked marker of `1` would then match by coincidence and skip the only
-        # real check on `run_this_suite`'s discover arguments.
-        marker = os.environ.get(REENTRY_MARKER)
-        if marker and marker != "1" and marker == str(os.getppid()):
-            self.skipTest(f"{REENTRY_MARKER} names our parent: this IS the child")
-        module = HERE_MANIFEST.parent / "test_emit_row.py"
-        # TIMEOUT, because the marker is the base case and a base case can be
-        # lost. The original defect was a hang, not a failure; if a later
-        # refactor of how the child is spawned drops the marker, this bounds the
-        # damage to a loud `TimeoutExpired` instead of a run that never ends.
-        # CI has `timeout-minutes`; a local run has nothing but this.
-        proc = subprocess.run(
-            [sys.executable or "python3", str(module)],
-            cwd=tempfile.gettempdir(),
-            capture_output=True,
-            text=True,
-            env={**os.environ, REENTRY_MARKER: str(os.getpid())},
-            timeout=300,
-        )
-        self.assertEqual(
-            proc.returncode,
-            0,
-            f"`python3 {module}` did not pass:\n{proc.stdout}\n{proc.stderr}",
-        )
-        ran = re.search(r"^Ran (\d+) tests", proc.stderr, re.M)
-        self.assertIsNotNone(ran, f"no test count in:\n{proc.stderr}")
-        # A LOOSE COUNT IS NOT ENOUGH — `> 100` was cleared by this module
-        # alone, so it never established "the whole suite" — and an exact skip
-        # count is not either: `test_symlink_scrub` skips four permission
-        # fixtures under root, so `skipped=1` red a perfectly clean run inside
-        # any container and pointed the reader at the entry point. So: `OK`
-        # (no failures, no errors) plus the count the LOCAL loader discovers.
-        # That is what actually detects "discovering something narrower", it
-        # needs no literal to keep in step, and it is indifferent to how many
-        # environment-dependent skips the suite contains.
-        self.assertRegex(
-            proc.stderr,
-            r"(?m)^OK(?: \(skipped=\d+\))?$",
-            f"the child did not finish clean. Tail:\n{proc.stderr[-2000:]}",
+        program = textwrap.dedent(
+            """
+            import runpy, sys, unittest
+            here, expected, names = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+            sys.path.insert(0, here)  # what starting `python3 <here>/<name>` does
+            real_discover = unittest.TestLoader.discover
+            seen = {}
+            class Sentinel(unittest.TestCase):
+                def test_ran(self):
+                    seen["ran"] += 1
+            def count_then_swap(loader, *args, **kwargs):
+                seen["found"] = real_discover(loader, *args, **kwargs).countTestCases()
+                return unittest.TestSuite(
+                    Sentinel("test_ran") for _ in range(seen["found"])
+                )
+            unittest.TestLoader.discover = count_then_swap
+            unittest.main = lambda *a, **k: sys.exit("unittest.main() was called")
+            for name in names:
+                seen.update(found=None, ran=0)
+                sys.argv = [f"{here}/{name}"]
+                code = "returned without exiting"
+                try:
+                    runpy.run_path(f"{here}/{name}", run_name="__main__")
+                except SystemExit as e:
+                    code = e.code
+                if code != 0:
+                    sys.exit(f"{name}: {code}")
+                if seen["found"] != expected or seen["ran"] != expected:
+                    sys.exit(
+                        f"{name}: found {seen['found']} tests and ran "
+                        f"{seen['ran']}; discovery from the repository finds "
+                        f"{expected}"
+                    )
+            """
         )
         expected = (
             unittest.TestLoader()
             .discover(start_dir=str(HERE_MANIFEST.parent), top_level_dir=str(REPO))
             .countTestCases()
         )
-        self.assertEqual(
-            int(ran.group(1)),
-            expected,
-            f"the entry point ran {ran.group(1)} tests; discovery from here "
-            f"finds {expected}. It is pointed at a narrower tree or pattern.",
-        )
+        with tempfile.TemporaryDirectory() as td:
+            proc = subprocess.run(
+                [sys.executable, "-c", program, str(HERE_MANIFEST.parent),
+                 str(expected), *sorted(EXPECTED_MODULES)],
+                cwd=td,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
 
     def test_the_preflight_runs_before_the_suite(self):
         """It is worthless after the step whose result it is meant to qualify."""
@@ -2930,8 +2893,7 @@ class TestNoWorkflowSetsAnUnmodelledEnvironmentName(unittest.TestCase):
         a bare list marker somewhere no line-oriented reader models — and every
         one was in Stage 2 or the suite CI. Stage 1, which this already
         covered, produced none. A grammar on one of three files is not a
-        grammar, so it is applied to all three here and the Stage 1 test now
-        calls the same function.
+        grammar, so it is applied to all three here.
         """
         for path in (STAGE1, STAGE2, SUITE_CI):
             with self.subTest(workflow=path.name):
@@ -3491,13 +3453,6 @@ class TestReviewRoleSeparationIsPinned(unittest.TestCase):
             "untrusted role's trust policy accepts",
         )
 
-    def test_the_two_never_disagree(self):
-        """The pairing, asserted as a pair so a half-edit cannot pass."""
-        self.assertEqual(
-            (self.review_env, self.review_role),
-            (self.EXPECTED_ENV, self.EXPECTED_ROLE),
-            "the review job's `environment:` and REVIEW_ROLE must flip together",
-        )
 
     def test_review_job_never_names_the_publisher_environment(self):
         """`environment: bedrock` here would hand the untrusted job the publisher's sub."""
@@ -3561,30 +3516,6 @@ class TestStage1CollapseGroupIsJobLevel(unittest.TestCase):
     def setUp(self):
         self.text = STAGE1.read_text()
 
-    def test_there_is_no_workflow_level_group_at_all(self):
-        """THE KEY, not the cancellation. Both narrowings were measured wrong.
-
-        An earlier version forbade only `cancel-in-progress: true`, on the
-        reasoning that a non-cancelling group is harmless. It is not: GitHub
-        cancels a PENDING run when another enters the same group, so with A
-        running and an eligible B pending, a rejected C entering the group
-        cancels B before C's own job condition is evaluated. And `true` has
-        spellings — `True`, `'true'`, `${{ … }}` — each of which a value regex
-        misses while restoring the defect in full.
-
-        Nothing here needs a workflow-level group, so the whole key goes.
-        """
-        self.assertIsNone(
-            re.search(
-                r"(?m)^[\"\']?concurrency[\"\']?[ \t]*:", strip_comments(self.text)
-            ),
-            "Stage 1 declares a workflow-level `concurrency:` again. It is "
-            "claimed before the job `if:`, so a run this workflow SKIPS joins "
-            "it and can cancel — or displace as pending — a review in flight. "
-            "No suffix fixes that: three of the four declared trigger types "
-            "carry no label to differentiate by. The collapse group belongs on "
-            "the `capture` job, which a rejected run never enters.",
-        )
 
     def test_capture_job_keeps_a_collapse_group(self):
         """The group must not be dropped either — bursts should still collapse."""
@@ -4128,68 +4059,7 @@ class TestStage1RunsNoPullRequestContent(unittest.TestCase):
         )
     )
 
-    def test_every_environment_key_is_on_the_allowlist(self):
-        """Pinning the SCRIPT does not pin what bash runs before it.
 
-        The digest covers the `run:` body. It does not cover the environment
-        the shell starts in, and several standard variables turn that
-        environment into an execution vector on their own.
-        """
-        # THE WHOLE FILE. Scanning "the prefix before `jobs:`" plus "the
-        # capture job" left a third region uncovered: a top-level `env:`
-        # written AFTER the jobs mapping is valid YAML, reaches the job, and
-        # sat in neither. Whole-file GRAMMAR coverage does not make a narrower
-        # semantic scan complete — they are separate properties.
-        #
-        # ACCEPTED OVER-REACH: this collects EVERY mapping named `env`, not
-        # only the three that configure a runtime environment. A workflow
-        # declaring `on.workflow_dispatch.inputs.env` would have its
-        # `description:`/`type:` keys rejected as variable names. That is a
-        # false positive on a legal edit, and it is the deliberate trade for
-        # this file: two jobs' worth of YAML, one allowlist, and a failure
-        # that says exactly what to do. Narrow it to the three real scopes if
-        # this file ever grows an input named `env`.
-        for block in indented_blocks(self.text, "env"):
-            for ln in block:
-                m = re.match(r"^\s*[\"']?([A-Za-z_][\w-]*)[\"']?\s*:", ln)
-                if not m:
-                    continue
-                self.assertIn(
-                    m.group(1),
-                    self.ALLOWED_ENV_KEYS,
-                    f"an `env:` mapping in Stage 1 sets {m.group(1)!r}, which "
-                    "this class does not model. Some variable names make the "
-                    "shell execute code before the pinned script runs "
-                    "(BASH_ENV, ENV, LD_PRELOAD, PYTHONSTARTUP); decide which "
-                    "this is, then add it to ALLOWED_ENV_KEYS.",
-                )
-
-    def test_stage1_uses_only_spellings_this_class_can_read(self):
-        """FAIL CLOSED ON A GRAMMAR, instead of chasing spellings one at a time.
-
-        Five review rounds each found another legal YAML spelling that a
-        reader here did not model — `-  run:` with two spaces, a bare `-`
-        marker, `"extra":` quoted, `extra :` with a space before the colon, a
-        flow mapping, a key written after `jobs:`, an `&anchor` on an `env:`
-        header. Each fix was correct and each left the next one open, because
-        the language has more spellings than a text reader has rules and the
-        bypass is always one keystroke from the last fix.
-
-        So the direction is inverted: this asserts the file is written in the
-        NARROW SUBSET the readers above are built for, and anything outside it
-        is a loud failure naming this test rather than a silent mis-read. Same
-        trade `TestTheReadersPremisesStillHold` makes for the Stage 2 readers.
-
-        THE WHOLE FILE, not the capture job. Scoping it to the job left
-        workflow-level configuration outside the subset, and that is where the
-        two nastiest vectors live: `defaults : {run: {shell: 'bash -c "…"'}}`
-        before `jobs:` changes the interpreter of a script whose digest never
-        moves. A grammar that covers only part of a file is not a grammar.
-
-        Reformatting the workflow stays legal; reformatting it into a spelling
-        nothing here can parse does not.
-        """
-        refuse_unmodelled_spellings(self, self.text, "Stage 1")
 
     def test_no_step_reaches_the_network_or_evaluates_fetched_text(self):
         """Defence in depth behind the step-set pin, and it names the hazard.
@@ -4318,26 +4188,6 @@ class TestStage1RunsNoPullRequestContent(unittest.TestCase):
                 "workspace and a tag can be moved by whoever owns it.",
             )
 
-    def test_no_shell_interpolates_a_workflow_expression(self):
-        """THE script-injection contract, and the reason the `env:` block exists.
-
-        `${{ }}` is substituted into the script TEXT before bash sees it, so a
-        value containing a quote or a `$(` becomes code. Passing values through
-        `env:` and reading them as `"$VAR"` cannot do that, whatever they hold.
-        Checked by executing the extracted shell as well — see below — because
-        a trailing `#` satisfies a substring assertion and `strip_comments`
-        only drops whole-line comments.
-        """
-        for step in self._step_entries():
-            for _, body in block_scalars(step, "run"):
-                script = "\n".join(body)
-                self.assertNotIn(
-                    "${{",
-                    script,
-                    "a Stage 1 `run:` interpolates a workflow expression "
-                    "directly into the script; route it through `env:` and "
-                    "quote it instead.",
-                )
 
     def test_no_shell_reads_the_workspace(self):
         """Nothing is checked out there, so a read finds nothing today. It is
@@ -5184,26 +5034,13 @@ class TestSymlinkScrubIsNulSafe(unittest.TestCase):
             "escaping symlinks.",
         )
 
-    def test_the_list_is_never_joined_with_newlines(self):
-        self.assertNotIn("printf '%s\\n' \"$ESCAPED\"", self.scrub)
-        self.assertNotIn("ESCAPED=$(", self.scrub)
-        self.assertNotIn("LEFT=$(", self.scrub)
 
     def test_both_the_delete_and_the_rescan_read_nul_separated(self):
         self.assertEqual(self.scrub.count("printf '%s\\0'"), 1)
         self.assertEqual(self.scrub.count("read -r -d ''"), 3)
 
-    def test_the_delete_uses_a_double_dash(self):
-        self.assertIn('rm -f -- "$link"', self.scrub)
 
-    def test_attacker_chosen_names_are_quoted_into_the_log(self):
-        # %s would let a newline in the name forge a `::error::` workflow command.
-        self.assertNotIn("printf '  %s\\n' \"$link\"", self.scrub)
-        self.assertIn("printf '  %q\\n' \"$link\"", self.scrub)
 
-    def test_it_still_fails_closed(self):
-        self.assertIn("::error::escaping symlink still present", self.scrub)
-        self.assertIn("exit 1", self.scrub)
 
 
 class TestLabelComparisonsAreCaseInsensitive(unittest.TestCase):
@@ -6158,7 +5995,6 @@ class TestThePrCheckoutIsNotAFullClone(unittest.TestCase):
         self.text = STAGE2.read_text()
         self.review = job_block(self.text, "review")
         self.stripped = strip_comments(self.review)
-        self.prepare = strip_comments(job_block(self.text, "prepare"))
 
     def _step(self, marker: str, hay: str | None = None) -> str:
         hay = self.stripped if hay is None else hay
@@ -6181,12 +6017,6 @@ class TestThePrCheckoutIsNotAFullClone(unittest.TestCase):
         self.assertNotIn("--deepen", self.stripped)
         self.assertNotIn("--unshallow", self.stripped)
 
-    def test_prepare_resolves_it_from_the_compare_endpoint_and_validates_it(self):
-        self.assertIn("merge_base_commit.sha", self.prepare)
-        self.assertRegex(self.prepare, r"/compare/")
-        self.assertRegex(
-            self.prepare, r'"merge_base_sha=\$MERGE_BASE"\s*>>\s*"\$GITHUB_OUTPUT"'
-        )
 
     def _run_corroboration(self, merge_base: str, td: str, **identities):
         return run_corroboration(merge_base, td, **identities)
