@@ -324,6 +324,9 @@ int munmap(void* addr, size_t length) {
 #else
 #include <torch/csrc/inductor/aoti_runtime/utils.h>
 #endif // USE_XPU
+#ifdef USE_MTIA
+#include <torch/csrc/inductor/aoti_runtime/utils_mtia.h>
+#endif // USE_MTIA
 #include <torch/csrc/inductor/aoti_runtime/constant_type.h>
 
 // At codegen time, we write out a binary file called constants.bin.
@@ -1238,7 +1241,7 @@ inline void parse_device_str(
     const std::string& device_str,
     int32_t& device_type,
     int32_t& device_idx) {
-  std::regex re("(cpu|cuda|xpu|mps)(:([0-9]+))?");
+  std::regex re("(cpu|cuda|xpu|mps|mtia)(:([0-9]+))?");
   std::smatch sm;
   bool matched = std::regex_match(device_str, sm, re);
   AOTI_RUNTIME_CHECK(matched, "Invalid device: " + device_str);
@@ -1254,6 +1257,10 @@ inline void parse_device_str(
 #ifdef USE_MPS
   } else if (sm[1].str() == "mps") {
     device_type = aoti_torch_device_type_mps();
+#endif
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0 && defined(USE_MTIA)
+  } else if (sm[1].str() == "mtia") {
+    device_type = aoti_torch_device_type_mtia();
 #endif
   } else {
     AOTI_RUNTIME_CHECK(false, "Invalid device: " + device_str);
@@ -1339,6 +1346,18 @@ class AOTInductorModelBase {
         cubin_dir_(std::move(cubin_dir)),
         include_weights(include_weights) {
     parse_device_str(device_str, device_type_, device_idx_);
+
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0 && defined(USE_MTIA)
+    if (device_type_ == aoti_torch_device_type_mtia()) {
+      AOTI_RUNTIME_CHECK(
+          num_constants == 0,
+          "MTIA AOTInductor does not support serialized constants; pass them as inputs");
+      if (device_idx_ == -1) {
+        AOTI_TORCH_ERROR_CODE_CHECK(
+            aoti_torch_get_current_device_index(&device_idx_));
+      }
+    }
+#endif
 
 #ifdef USE_CUDA
     if (device_idx_ == -1) {
