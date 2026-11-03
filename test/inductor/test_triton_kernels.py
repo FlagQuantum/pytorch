@@ -27,6 +27,7 @@ from torch._higher_order_ops.triton_kernel_wrap import (
     triton_kernel_wrapper_mutation,
 )
 from torch._inductor import config as inductor_config, metrics
+from torch._inductor.ir import UserDefinedTritonKernel
 from torch._inductor.pattern_matcher import (
     CallFunctionVarArgs,
     PatternMatcherPass,
@@ -35,6 +36,7 @@ from torch._inductor.pattern_matcher import (
 from torch._inductor.utils import (
     fresh_cache,
     run_and_get_code,
+    run_and_get_graph_lowering,
     run_and_get_kernels,
     triton_version_uses_attrs_dict,
 )
@@ -2117,6 +2119,111 @@ def forward(self, x_1, output_1):
         compiled_inductor_f = torch.compile(f, backend="inductor", fullgraph=True)
         compiled_inductor_out = compiled_inductor_f(x)
         self.assertEqual(compiled_inductor_out, eager_out)
+
+    @inductor_config.patch(
+        triton_kernel_default_layout_constraint="needs_fixed_stride_order",
+        force_disable_caches=True,
+    )
+    @requires_gpu
+    @parametrize("unique_kernel_names", [False, True])
+    def test_layout_constraint_writes_a_shared_input_once(self, unique_kernel_names):
+        def f(x, y):
+            z = (x * 2).relu()
+            a = torch.empty_like(x)
+            b = torch.empty_like(x)
+            n_elements = x.numel()
+            add_kernel[(n_elements // 16,)](z, z, a, n_elements, BLOCK_SIZE=16)
+            add_kernel[(n_elements // 16,)](z, y, b, n_elements, BLOCK_SIZE=16)
+            return a + b
+
+        x = torch.randn(64, device=GPU_TYPE)
+        y = torch.randn(64, device=GPU_TYPE)
+        with inductor_config.patch("triton.unique_kernel_names", unique_kernel_names):
+            compiled_out, (graph,) = run_and_get_graph_lowering(
+                torch.compile(f, fullgraph=True), x, y
+            )
+        self.assertEqual(compiled_out, f(x, y))
+        kernels = [
+            op for op in graph.operations if isinstance(op, UserDefinedTritonKernel)
+        ]
+        self.assertEqual(len(kernels), 2)
+        shared_inputs = (
+            kernels[0].kwargs["in_ptr0"],
+            kernels[0].kwargs["in_ptr1"],
+            kernels[1].kwargs["in_ptr0"],
+        )
+        self.assertEqual(len({arg.get_name() for arg in shared_inputs}), 1)
+
+    @inductor_config.patch(
+        triton_kernel_default_layout_constraint="needs_fixed_stride_order",
+        force_disable_caches=True,
+    )
+    @requires_gpu
+    @parametrize("view_first", [False, True])
+    @parametrize("use_eager_input_vals", [False, True])
+    def test_layout_constraint_shares_input_with_transpose(
+        self, view_first, use_eager_input_vals
+    ):
+        # Triton TR001: fixed launch parameters isolate layout behavior.
+        @triton.jit
+        def add_strided_kernel(  # triton-lint: disable=TR001
+            in_ptr0,
+            in_ptr1,
+            out_ptr,
+            n_elements,
+            COLS0: tl.constexpr,
+            COLS1: tl.constexpr,
+            STRIDES0: tl.constexpr,
+            STRIDES1: tl.constexpr,
+            BLOCK_SIZE: tl.constexpr,
+        ):
+            offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            offsets0 = offsets // COLS0 * STRIDES0[0] + offsets % COLS0 * STRIDES0[1]
+            offsets1 = offsets // COLS1 * STRIDES1[0] + offsets % COLS1 * STRIDES1[1]
+            mask = offsets < n_elements
+            a = tl.load(in_ptr0 + offsets0, mask=mask)
+            b = tl.load(in_ptr1 + offsets1, mask=mask)
+            tl.store(out_ptr + offsets, a + b, mask=mask)
+
+        def f(x):
+            z = (x * 2).relu()
+            a, b = (z.T, z) if view_first else (z, z.T)
+            out = torch.empty(x.numel(), dtype=x.dtype, device=x.device)
+            add_strided_kernel[(triton.cdiv(x.numel(), 32),)](
+                a,
+                b,
+                out,
+                x.numel(),
+                COLS0=a.shape[1],
+                COLS1=b.shape[1],
+                STRIDES0=a.stride(),
+                STRIDES1=b.stride(),
+                BLOCK_SIZE=32,
+            )
+            return out
+
+        def remove_eager_input_vals(graph):
+            for node in graph.nodes:
+                node.meta.pop("eager_input_vals", None)
+
+        x = torch.randn(7, 3, device=GPU_TYPE).T
+        with inductor_config.patch(
+            post_grad_custom_post_pass=(
+                None if use_eager_input_vals else remove_eager_input_vals
+            )
+        ):
+            compiled_out, (graph,) = run_and_get_graph_lowering(
+                torch.compile(f, fullgraph=True), x
+            )
+        self.assertEqual(compiled_out, f(x))
+        kernels = [
+            op for op in graph.operations if isinstance(op, UserDefinedTritonKernel)
+        ]
+        self.assertEqual(len(kernels), 1)
+        self.assertEqual(
+            kernels[0].kwargs["in_ptr0"].get_name(),
+            kernels[0].kwargs["in_ptr1"].get_name(),
+        )
 
     @requires_gpu
     def test_triton_kernel_strided_input_nonzero_offset(self):
