@@ -18,6 +18,7 @@ class LeafGuard:
     def verbose_code_parts(self) -> list[str]: ...
 
 class RelationalGuard: ...
+class NN_MODULE_HOOK_MEMBERSHIP(RelationalGuard): ...
 
 class GuardDebugInfo:
     verbose_code_parts: list[str]
@@ -461,6 +462,13 @@ class GetAttrGuardAccessor(GuardAccessor):
 def install_object_alias_pattern_guard(
     guard_managers: Sequence[GuardManager],
     aliases: Sequence[int],
+    verbose_code_parts: list[str],
+    user_stack: traceback.StackSummary | None,
+) -> None: ...
+def install_nn_module_hook_membership_guard(
+    hooks: GuardManager,
+    flags: GuardManager,
+    expected: Sequence[bool],
     verbose_code_parts: list[str],
     user_stack: traceback.StackSummary | None,
 ) -> None: ...

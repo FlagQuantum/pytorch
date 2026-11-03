@@ -601,6 +601,7 @@ def build_reuse_condition(
             sorted(tx.output.guards.get_guards_for_source(source), key=Guard.sort_key)
         )
 
+    traced_sources = traced_sources.copy()
     guard_tuples: list[tuple[Source, GuardCheckSpec, object, Guard]] = []
     for guard in all_relevant_guards:
         source = guard.originating_source
@@ -615,8 +616,18 @@ def build_reuse_condition(
                 f"subgraph_reuse: unsupported guard type '{type_str}' on source '{source.name}'"
             )
 
+        handler = cast(GuardCheckSpec, handler)
         try:
             value = tx.output.resolve_source_value(source)
+            if handler.get_extra_sources_fn is not None:
+                extra_sources = OrderedSet(handler.get_extra_sources_fn(guard))
+                traced_sources.update(extra_sources)
+                if has_mutated_vars(tx, extra_sources):
+                    return None
+                value = (
+                    value,
+                    *(tx.output.resolve_source_value(s) for s in extra_sources),
+                )
         except Exception:
             raise RuntimeError(
                 f"subgraph_reuse: failed to resolve source '{source.name}' for {type_str} guard"
@@ -627,7 +638,6 @@ def build_reuse_condition(
         # if type_str == "CONSTANT_MATCH" and isinstance(value, str):
         #     continue
 
-        handler = cast(GuardCheckSpec, handler)
         expected = handler.get_metadata_fn(guard, value)
         guard_tuples.append((source, handler, expected, guard))
 
@@ -912,6 +922,14 @@ def is_reusable(
 
         try:
             value = match.resolve(new_source)
+            if handler.get_extra_sources_fn is not None:
+                value = (
+                    value,
+                    *(
+                        match.resolve(s)
+                        for s in handler.get_extra_sources_fn(new_guard)
+                    ),
+                )
         except Exception:
             hc_log.debug(
                 "subgraph_reuse: reuse failed -- cannot resolve source\n"
