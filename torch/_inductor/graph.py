@@ -2112,7 +2112,47 @@ class GraphLowering(torch.fx.Interpreter):
                     old_args = args  # type: ignore[possibly-undefined]
                     old_kwargs = kwargs  # type: ignore[possibly-undefined]
 
-                    if eager_input_vals := n.meta.get("eager_input_vals"):
+                    eager_input_vals = n.meta.get("eager_input_vals")
+
+                    def realize_base_input(arg: Any, fake_arg: Any) -> Any:
+                        if isinstance(fake_arg, Node):
+                            fake_arg = fake_arg.meta.get("val")
+                        if (
+                            isinstance(arg, TensorBox)
+                            and isinstance(arg.data, StorageBox)
+                            and isinstance(fake_arg, Tensor)
+                        ):
+                            arg.realize()
+                            if eager_input_vals:
+                                return ir.ExternKernel.require_exact_strides(
+                                    arg, fake_arg.stride()
+                                )
+                            return ir.ExternKernel.require_stride_order(
+                                arg,
+                                ir.get_stride_order(
+                                    fake_arg.stride(), self.sizevars.shape_env
+                                ),
+                            )
+                        elif isinstance(arg, dict) and isinstance(fake_arg, dict):
+                            return {
+                                key: realize_base_input(arg[key], fake_arg[key])
+                                for key in arg
+                            }
+                        elif isinstance(arg, (tuple, list)) and isinstance(
+                            fake_arg, (tuple, list)
+                        ):
+                            return type(arg)(
+                                realize_base_input(a, f_a)
+                                for a, f_a in zip(arg, fake_arg)
+                            )
+                        return arg
+
+                    args, kwargs = realize_base_input(
+                        (old_args, old_kwargs),
+                        eager_input_vals or (n.args, n.kwargs),
+                    )
+
+                    if eager_input_vals:
                         inp_args = eager_input_vals[0]
                         inp_kwargs = eager_input_vals[1]
                         args, kwargs = constrain_to_fake_tensors(
