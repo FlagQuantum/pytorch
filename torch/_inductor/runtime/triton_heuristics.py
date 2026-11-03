@@ -5434,7 +5434,7 @@ def template(
         inductor_meta=inductor_meta,
         heuristic_type=HeuristicType.TEMPLATE,
         filename=filename,
-        # Its config carries compile options, such as ctas_per_cga, a table row does not.
+        # Its config can carry TLX-only compile options, which a table row does not.
         pinnable=False,
     )
 
@@ -5446,6 +5446,7 @@ def _pop_config_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         "num_warps",
         "num_stages",
         "num_ctas",
+        "ctas_per_cga",
         "maxnreg",
         "num_consumer_groups",
         "num_buffers_warp_spec",
@@ -5466,6 +5467,9 @@ def config_to_dict(config: Config) -> dict[str, Any]:
     # survive the round trip or a user config's register cap silently vanishes.
     if getattr(config, "maxnreg", None) is not None:
         config_dict["maxnreg"] = config.maxnreg
+    # Likewise ctas_per_cga, or a user config's cluster shape silently vanishes.
+    if getattr(config, "ctas_per_cga", None) is not None:
+        config_dict["ctas_per_cga"] = config.ctas_per_cga
     if HAS_WARP_SPEC:
         config_dict.update(
             {

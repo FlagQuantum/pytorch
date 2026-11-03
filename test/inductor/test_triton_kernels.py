@@ -2225,6 +2225,21 @@ def forward(self, x_1, output_1):
             kernels[0].kwargs["in_ptr1"].get_name(),
         )
 
+    @unittest.skipIf(not has_triton_package(), "requires triton")
+    def test_config_to_dict_keeps_ctas_per_cga(self):
+        if "ctas_per_cga" not in inspect.signature(triton.Config.__init__).parameters:
+            raise unittest.SkipTest("this Triton has no ctas_per_cga")
+        from torch._inductor.runtime.triton_heuristics import (
+            config_from_dict,
+            config_to_dict,
+        )
+
+        config = config_from_dict(
+            config_to_dict(triton.Config({"BLOCK": 64}, ctas_per_cga=(2, 1, 1)))
+        )
+        self.assertEqual(config.ctas_per_cga, (2, 1, 1))
+        self.assertEqual(config.kwargs, {"BLOCK": 64})
+
     @requires_gpu
     def test_triton_kernel_strided_input_nonzero_offset(self):
         def f(inp):
