@@ -112,6 +112,25 @@ def get_pr_number() -> int | None:
     return None
 
 
+def td_enabled_workflow(workflow: str) -> bool:
+    """Whether run_test.py enables TD under GITHUB_WORKFLOW `workflow`."""
+    return workflow in ("trunk", "pull") or workflow.startswith(
+        ("rocm-", "periodic-rocm-")
+    )
+
+
+def td_enabled_job(
+    build_environment: str, *, macos: bool, no_td: bool, tests_to_include: str
+) -> bool:
+    """The job-level rest of run_test.py's --enable-td default: TD is off on
+    macOS, in xpu and onnx builds, under NO_TD, and when TESTS_TO_INCLUDE
+    names tests."""
+    env = build_environment
+    return not (
+        no_td or macos or "xpu" in env or "onnx" in env or tests_to_include.strip()
+    )
+
+
 @cache
 def get_merge_base() -> str:
     pr_number = get_pr_number()

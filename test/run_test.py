@@ -16,6 +16,7 @@ import sys
 import sysconfig
 import tempfile
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import ExitStack
@@ -65,11 +66,16 @@ from tools.testing.discover_tests import (
     TESTS,
 )
 from tools.testing.do_target_determination_for_s3 import import_results
+from tools.testing.llm_td.selection import LLM_TD_SELECTION_FILE, split_tests
 from tools.testing.target_determination.gen_artifact import gen_ci_artifact
 from tools.testing.target_determination.heuristics.previously_failed_in_pr import (
     gen_additional_test_failures_file,
 )
-from tools.testing.target_determination.heuristics.utils import get_pr_number
+from tools.testing.target_determination.heuristics.utils import (
+    get_pr_number,
+    td_enabled_job,
+    td_enabled_workflow,
+)
 from tools.testing.test_run import TestRun
 from tools.testing.test_selections import (
     calculate_shards,
@@ -1790,20 +1796,20 @@ def parse_args():
         default=IS_CI and not strtobool(os.environ.get("NO_TEST_TIMEOUT", "False")),
     )
     GITHUB_WORKFLOW = os.environ.get("GITHUB_WORKFLOW", "slow")
+    no_td = strtobool(os.environ.get("NO_TD", "False"))
     parser.add_argument(
         "--enable-td",
         action="store_true",
         help="Enables removing tests based on TD",
         default=IS_CI
         and get_pr_number() is not None
-        and not strtobool(os.environ.get("NO_TD", "False"))
-        and not IS_MACOS
-        and "xpu" not in BUILD_ENVIRONMENT
-        and "onnx" not in BUILD_ENVIRONMENT
-        and (
-            GITHUB_WORKFLOW in ("trunk", "pull")
-            or GITHUB_WORKFLOW.startswith(("rocm-", "periodic-rocm-"))
-        ),
+        and td_enabled_job(
+            BUILD_ENVIRONMENT,
+            macos=IS_MACOS,
+            no_td=no_td,
+            tests_to_include=os.environ.get("TESTS_TO_INCLUDE", ""),
+        )
+        and td_enabled_workflow(GITHUB_WORKFLOW),
     )
     parser.add_argument(
         "--shard",
@@ -2487,17 +2493,17 @@ def main():
             # No explicit --include, use env var tests
             options.include = list(env_tests)
 
-        options.enable_td = False
-
     # Include sharding info in all metrics
     which_shard, num_shards = get_sharding_opts(options)
     add_global_metric("shard", which_shard)
     add_global_metric("num_shards", num_shards)
+    # Joins one call's metrics: test.sh runs some files several times per job.
+    add_global_metric("call_id", uuid.uuid4().hex)
 
     test_directory = str(REPO_ROOT / "test")
     selected_tests = get_selected_tests(options)
 
-    test_prioritizations = import_results()
+    test_prioritizations, previous_failures = import_results()
     if len(test_prioritizations.get_all_tests()) == 0:
         options.enable_td = False
     test_prioritizations.amend_tests(selected_tests)
@@ -2545,17 +2551,38 @@ def main():
             return s.strip()
 
     percent_to_run = 25 if options.enable_td else 100
-    print_to_stderr(
-        f"Running {percent_to_run}% of tests based on TD"
-        if options.enable_td
-        else "Running all tests"
-    )
     include, exclude = test_prioritizations.get_top_per_tests(percent_to_run)
 
-    test_batch = TestBatch("tests to run", include, False)
-    test_batch_exclude = TestBatch("excluded", exclude, True)
+    # The LLM test selection, if CI downloaded one; see tools/testing/llm_td.
+    selection_file = REPO_ROOT / ADDITIONAL_CI_FILES_FOLDER / LLM_TD_SELECTION_FILE
+    split = split_tests(
+        include,
+        exclude,
+        test_prioritizations.get_score,
+        test_file_times_dict,
+        selection_file=selection_file,
+        test_config=TEST_CONFIG,
+        td_enabled=options.enable_td,
+        previously_failed=previous_failures,
+    )
+    if not split.enforced:
+        print_to_stderr(
+            f"Running {percent_to_run}% of tests based on TD"
+            if options.enable_td
+            else "Running all tests"
+        )
+
+    test_batch = TestBatch("tests to run", split.include, False)
+    test_batch_exclude = TestBatch("excluded", split.exclude, True)
     if IS_CI:
-        gen_ci_artifact([x.to_json() for x in include], [x.to_json() for x in exclude])
+        gen_ci_artifact(
+            [x.to_json() for x in split.include],
+            [x.to_json() for x in split.exclude],
+            source=split.source,
+            td_excluded=[x.to_json() for x in split.td_exclude],
+        )
+        if split.llm is not None:
+            emit_metric("llm_td_selection", split.llm.selection_metric)
 
     print_to_stderr(f"Running parallel tests on {NUM_PROCS} processes")
     print_to_stderr(test_batch)
@@ -2603,14 +2630,18 @@ def main():
             for test, _ in all_failures:
                 test_stats = test_prioritizations.get_test_stats(test)
                 print_to_stderr("Emitting td_test_failure_stats_v2")
+                # emit_metric records its caller, so these stay in main().
                 emit_metric(
                     "td_test_failure_stats_v2",
                     {
                         "selected_tests": selected_tests,
                         "failure": str(test),
+                        "llm_enforced": split.enforced,
                         **test_stats,
                     },
                 )
+                if split.llm is not None:
+                    emit_metric("llm_td_failure", split.llm.failure_metric(test))
             gen_additional_test_failures_file(
                 [test.test_file for test, _ in all_failures]
             )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
@@ -9,20 +10,43 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+from tools.testing import do_target_determination_for_s3
 from tools.testing.discover_tests import BLOCKLISTED_PATTERNS, TESTS
+from tools.testing.do_target_determination_for_s3 import (
+    import_results,
+    PREVIOUS_FAILURES_KEY,
+    td_results_json,
+)
 from tools.testing.llm_td import select_tests, selection
 from tools.testing.llm_td.selection import (
+    apply_selection,
     DRIVER_MAPPINGS,
     needs_run_all,
     normalize_test_name,
     Selection,
+    split_tests,
 )
+from tools.testing.target_determination import gen_artifact
+from tools.testing.target_determination.heuristics import previously_failed_in_pr
+from tools.testing.target_determination.heuristics.interface import TestPrioritizations
+from tools.testing.target_determination.heuristics.previously_failed_in_pr import (
+    get_all_previous_failures,
+)
+from tools.testing.target_determination.heuristics.utils import (
+    td_enabled_job,
+    td_enabled_workflow,
+)
+from tools.testing.test_run import TestRun
+
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
 
 
 CANDIDATES = {
@@ -304,6 +328,161 @@ class TestSelection(unittest.TestCase):
             p.write_text(json.dumps(sel.to_json()))
             self.assertEqual(Selection.load(p), sel)
 
+    def test_previous_failures_skip_bad_entries_like_td(self) -> None:
+        def scored() -> set[str]:
+            heuristic = previously_failed_in_pr.PreviouslyFailedInPR()
+            tp = heuristic.get_prediction_confidence(["test_nn", "test_ops"])
+            return {str(x) for x in tp.get_all_tests() if tp.get_score(x) > 0}
+
+        with (
+            tempfile.TemporaryDirectory() as d,
+            mock.patch.object(previously_failed_in_pr, "REPO_ROOT", Path(d)),
+            mock.patch("sys.stdout"),
+            mock.patch("sys.stderr"),
+        ):
+            folder = Path(d) / ".additional_ci_files"
+            folder.mkdir()
+            self.assertEqual(get_all_previous_failures(), set())
+            (folder / "previous_failures.json").write_text(
+                '{"test/test_nn.py::TestNN::test_a": true}'
+            )
+            (folder / "previous_failures_additional.json").write_text('[1, "test_ops"]')
+            self.assertEqual(get_all_previous_failures(), {"test_nn", "test_ops"})
+            self.assertEqual(scored(), {"test_nn", "test_ops"})
+            for name in ("previous_failures.json", "previous_failures_additional.json"):
+                for text in ("{", "1", '[["x"]]', "[[1]]", "[" * 100_000):
+                    (folder / name).write_text(text)
+                    self.assertIsNone(get_all_previous_failures(), (name, text[:10]))
+                    # TD's determinator logs the error and skips the heuristic.
+                    with self.assertRaises(
+                        previously_failed_in_pr.PREVIOUS_FAILURES_ERRORS
+                    ):
+                        scored()
+                (folder / name).unlink()
+                (folder / name).mkdir()
+                self.assertIsNone(get_all_previous_failures(), (name, "a directory"))
+                (folder / name).rmdir()
+                (folder / name).write_text("[]")
+
+    def test_td_enabled(self) -> None:
+        # run_test.py's --enable-td default, which the eval harness shares.
+        for workflow in ("pull", "trunk", "rocm-mi300", "periodic-rocm-mi200"):
+            self.assertTrue(td_enabled_workflow(workflow), workflow)
+        for workflow in ("periodic", "inductor", "slow", "pull-rocm"):
+            self.assertFalse(td_enabled_workflow(workflow), workflow)
+        on = {"macos": False, "no_td": False, "tests_to_include": " "}
+        self.assertTrue(td_enabled_job("linux-jammy-py3.10", **on))
+        for env, kw in (("linux-xpu", {}), ("linux-onnx", {}), ("linux", {"macos": True}), ("linux", {"no_td": True}), ("linux", {"tests_to_include": "test_nn"})):  # fmt: skip
+            self.assertFalse(td_enabled_job(env, **{**on, **kw}), (env, kw))
+
+    def test_td_results_round_trip(self) -> None:
+        tp = TestPrioritizations(["test_nn", "test_ops"], {TestRun("test_nn"): 1})
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "td_results.json"
+            for failed in ({"test_ops", "elsewhere", "test_nn"}, set(), None):
+                td_results = td_results_json(tp, failed)
+                if failed is not None:
+                    self.assertEqual(td_results[PREVIOUS_FAILURES_KEY], sorted(failed))
+                p.write_text(json.dumps(td_results))
+                with mock.patch("sys.stderr"):
+                    loaded, loaded_failed = import_results(p)
+                self.assertEqual(loaded_failed, failed)
+                scores = [(str(x), loaded.get_score(x)) for x in loaded.get_all_tests()]
+                self.assertEqual(scores, [("test_nn", 1), ("test_ops", 0)])
+        # get_score is an exact lookup: a part of a scored file scores 0.
+        self.assertEqual(tp.get_score(TestRun("test_nn", included=["TestNN"])), 0.0)
+
+    def test_td_job_writes_the_previous_failures(self) -> None:
+        tp = TestPrioritizations(["test_nn", "test_ops"], {TestRun("test_nn"): 1})
+        heuristics = mock.Mock(**{"get_aggregated_priorities.return_value": tp})
+        fetches: dict[str, Any] = dict.fromkeys(
+            [
+                "get_test_times",
+                "get_test_class_times",
+                "get_test_file_ratings",
+                "get_test_class_ratings",
+                "get_td_heuristic_historial_edited_files_json",
+                "get_td_heuristic_profiling_json",
+                "copy_additional_previous_failures",
+            ],
+            mock.DEFAULT,
+        )
+        lastfailed = '{"test/test_ops.py::TestOps::test_a": true}'
+        # A failed or skipped download leaves no cache, as does a PR without
+        # one yet, so only the step's outcome makes the failures known.
+        for outcome, cache, failed in (
+            ("success", lastfailed, {"test_ops"}),
+            ("success", None, set()),
+            ("success", "{", None),
+            ("failure", None, None),
+            ("failure", lastfailed, None),
+            (None, None, None),
+        ):
+            with tempfile.TemporaryDirectory() as d:
+                folder = Path(d) / ".additional_ci_files"
+                folder.mkdir()
+
+                def copy_pytest_cache(cache: str | None = cache) -> None:
+                    if cache is not None:
+                        (folder / "previous_failures.json").write_text(cache)
+
+                env = {"CI": "false"}
+                if outcome is not None:
+                    env["PYTEST_CACHE_DOWNLOAD_OUTCOME"] = outcome
+                with (
+                    mock.patch.multiple(
+                        do_target_determination_for_s3,
+                        REPO_ROOT=Path(d),
+                        get_test_prioritizations=mock.Mock(return_value=heuristics),
+                        copy_pytest_cache=copy_pytest_cache,
+                        **fetches,
+                    ),
+                    mock.patch.object(previously_failed_in_pr, "REPO_ROOT", Path(d)),
+                    mock.patch.dict(os.environ, env),
+                    mock.patch("sys.stdout"),
+                    mock.patch("sys.stderr"),
+                ):
+                    if outcome is None:
+                        os.environ.pop("PYTEST_CACHE_DOWNLOAD_OUTCOME", None)
+                    do_target_determination_for_s3.main()
+                    _, loaded = import_results(Path(d) / "td_results.json")
+                self.assertEqual(loaded, failed, (outcome, cache))
+
+    def test_import_results(self) -> None:
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout"):
+            p = Path(d) / "td_results.json"
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                tp, failed = import_results(p)
+            self.assertEqual(
+                (tp.get_all_tests(), failed, stderr.getvalue()), ([], None, "")
+            )
+            tp = TestPrioritizations(["test_nn", "test_ops"], {TestRun("test_nn"): 1})
+            # An older writer stores only TD's ranking.
+            for value in ("missing", "test_nn", [1], None):
+                td_results = tp.to_json()
+                if value != "missing":
+                    td_results[PREVIOUS_FAILURES_KEY] = value
+                p.write_text(json.dumps(td_results))
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    self.assertIsNone(import_results(p)[1], value)
+                message = (
+                    "Previous failures not recorded in"
+                    if value == "missing"
+                    else "Ignoring the previous failures in"
+                )
+                self.assertIn(message, stderr.getvalue())
+            td_results = {
+                **tp.to_json(),
+                PREVIOUS_FAILURES_KEY: ["test_nn", "elsewhere"],
+            }
+            p.write_text(json.dumps(td_results))
+            loaded, failed = import_results(p)
+            self.assertEqual(failed, {"test_nn", "elsewhere"})
+            scores = [(str(x), loaded.get_score(x)) for x in loaded.get_all_tests()]
+            self.assertEqual(scores, [("test_nn", 1), ("test_ops", 0)])
+
     def test_run_all_patterns(self) -> None:
         for f in [
             ".ci/docker/common/install_cuda.sh",
@@ -438,6 +617,609 @@ class TestSelection(unittest.TestCase):
             self.assertEqual(driven, pattern not in undriven, pattern)
 
 
+class TestSplit(unittest.TestCase):
+    def split(
+        self,
+        sel: Selection,
+        scores: dict[TestRun, float],
+        times: dict[str, float],
+        prev: Collection[str] = (),
+        td: Collection[str] = (),
+        share: float | None = None,
+    ) -> tuple[list[str], list[str], selection.Split]:
+        tp = TestPrioritizations(times, scores)
+        ranked = tp.get_all_tests()
+        split = sel.split(
+            ranked,
+            tp.get_score,
+            times,
+            "default",
+            previously_failed=prev,
+            td_include=td,
+            share=share,
+        )
+        return [str(x) for x in split.include], [str(x) for x in split.exclude], split
+
+    def test_hedge_is_greedy_in_rank_order(self) -> None:
+        scores = {"a": 1, "b": 0.9, "c": 0.8, "d": 0.7, "untimed": 0.6, "neg": -0.5}
+        times: dict[str, float] = {"a": 10, "b": 150, "c": 52, "d": 48, "untimed": 0}
+        times |= {"zero": 1, "neg": 1, "rest": 738}
+        # The budget is 20% of 1000s = 200s. b leaves 50s, so c (52s, fits
+        # alone) is skipped and d (48s) still fits, leaving 2s that the
+        # unscored and negatively scored 1s files may not use. With 19% d does
+        # not fit, with 21% c does.
+        ranked = {TestRun(f): s for f, s in scores.items()}
+        include, exclude, split = self.split(Selection(files={"a"}), ranked, times)
+        self.assertEqual(include, ["a", "b", "d"])
+        self.assertEqual(exclude, ["c", "untimed", "rest", "zero", "neg"])
+        self.assertEqual(split.covered, {"a"})
+        self.assertEqual((split.hedged, split.budget), ({"b", "d"}, 200))
+        for share, hedged in ((0.19, {"b"}), (0.21, {"b", "c"})):
+            split = self.split(Selection(files={"a"}), ranked, times, share=share)[2]
+            self.assertEqual(split.hedged, hedged, share)
+
+    def test_nothing_chosen_keeps_td_include(self) -> None:
+        # A targeted call such as `run_test.py --include test_cuda`: one file
+        # is all of the call's time, so it never fits the 20% hedge.
+        scores, times = {TestRun("test_cuda"): 1.0}, {"test_cuda": 100.0}
+        for files, include in (({"a"}, []), ({"test_cuda"}, ["test_cuda"])):
+            sel = Selection(files=files)
+            got, _, split = self.split(sel, scores, times, td={"test_cuda"})
+            self.assertEqual((got, split.chose_nothing), (include, not include))
+
+    def test_partial_runs_of_a_file_are_charged_once(self) -> None:
+        f_a, f_rest = TestRun("f", included=["A"]), TestRun("f", excluded=["A"])
+        g_b = TestRun("g", included=["B"])
+        scores = {f_a: 1, g_b: 1, f_rest: 0.6, TestRun("h"): 0.5}
+        times: dict[str, float] = {"f": 40, "g": 30, "h": 130, "r": 800}
+        # f's two scored runs cost 40s once, and g's positive class pulls in
+        # its unscored rest, so h (130s) fits the 200s budget exactly.
+        include, exclude, split = self.split(Selection(), scores, times)
+        self.assertEqual(split.hedged, {"f", "g", "h"})
+        self.assertEqual(exclude, ["r"])
+        self.assertEqual(include, ["f, A", "g, B", "f, not (A)", "h", "g, not (B)"])
+
+    def test_previous_failures_in_td_always_run_outside_the_budget(self) -> None:
+        scores = {TestRun("s"): 1, TestRun("p"): 0.5, TestRun("q"): 0.4}
+        times: dict[str, float] = {"a": 10, "s": 150, "p": 100, "q": 60, "big": 600}
+        times |= {"untimed": 0, "rest": 80}
+        sel = Selection(files={"a"})
+        include, exclude, split = self.split(sel, scores, times)
+        self.assertEqual((include, split.hedged), (["s", "a"], {"s"}))
+        # p always runs and leaves the whole 200s budget to s, so q (60s)
+        # still does not fit next to s.
+        td = {"s", "p", "a"}
+        include, exclude, split = self.split(sel, scores, times, {"p", "a"}, td)
+        self.assertEqual(include, ["s", "p", "a"])
+        self.assertEqual((split.previously_failed, split.hedged), ({"p"}, {"s"}))
+        # big (three times the budget, unscored) and untimed also run because
+        # TD runs them, and the hedge still gets the whole budget.
+        scores[TestRun("tiny")] = 0.1
+        times |= {"tiny": 1, "rest": 79}
+        prev, td = {"p", "big", "untimed", "a", "elsewhere"}, {"p", "big", "untimed"}
+        include, exclude, split = self.split(sel, scores, times, prev, td)
+        self.assertEqual(include, ["s", "p", "tiny", "a", "big", "untimed"])
+        self.assertEqual(exclude, ["q", "rest"])
+        self.assertEqual((split.covered, split.budget), ({"a"}, 200))
+        self.assertEqual(split.previously_failed, {"p", "big", "untimed"})
+        self.assertEqual(split.hedged, {"s", "tiny"})
+
+    def test_only_a_previous_failure_chosen_is_a_choice(self) -> None:
+        # p is all of TD's include and over the budget, so only its previous
+        # failure runs it.
+        times = {"p": 500.0, "r": 500.0}
+        include, exclude, split = self.split(
+            Selection(), {TestRun("p"): 1}, times, prev={"p"}, td={"p"}
+        )
+        self.assertEqual((include, exclude), (["p"], ["r"]))
+        self.assertEqual((split.previously_failed, split.hedged), ({"p"}, set()))
+        self.assertFalse(split.chose_nothing)
+
+    def test_previous_failures_outside_td_are_hedged_like_other_files(self) -> None:
+        scores = {TestRun("s"): 1, TestRun("big"): 0.8, TestRun("p"): 0.5}
+        times: dict[str, float] = {"s": 150, "big": 600, "p": 40, "rest": 210}
+        # TD runs only s, so big (over budget) does not run and p is hedged
+        # after s like any other scored file.
+        include, exclude, split = self.split(
+            Selection(), scores, times, prev={"big", "p"}, td={"s"}
+        )
+        self.assertEqual((include, exclude), (["s", "p"], ["big", "rest"]))
+        self.assertEqual((split.previously_failed, split.hedged), (set(), {"s", "p"}))
+
+    def test_run_all_and_sweeps_take_everything(self) -> None:
+        for sel in (Selection(run_all=True), Selection(sweeps={"default"})):
+            include, exclude, split = self.split(sel, {}, {"a": 1, "b": 1})
+            self.assertEqual((include, exclude, split.hedged), (["a", "b"], [], set()))
+
+
+class TestApplySelection(unittest.TestCase):
+    TIMES: dict[str, float] = {"a": 10, "p": 20, "s": 170, "big": 600, "rest": 200}
+
+    def apply(
+        self,
+        sel: Selection,
+        td_enabled: bool = True,
+        pr_number: int | None = 1,
+        prev: Collection[str] | None = (),
+        times: dict[str, float] | None = None,
+        stderr: io.StringIO | None = None,
+    ) -> selection.AppliedSelection:
+        times = self.TIMES if times is None else times
+        tp = TestPrioritizations(list(self.TIMES), {TestRun("p"): 1, TestRun("s"): 0.5})
+        include, exclude = tp.get_top_per_tests(25)
+        with (
+            mock.patch.object(selection, "get_pr_number", return_value=pr_number),
+            mock.patch("sys.stderr", io.StringIO() if stderr is None else stderr),
+        ):
+            return apply_selection(
+                sel,
+                include,
+                exclude,
+                tp.get_score,
+                times,
+                test_config="default",
+                td_enabled=td_enabled,
+                previously_failed=prev,
+            )
+
+    def metric(self, enforced: bool) -> dict[str, object]:
+        # p previously failed, and s is hedged within the 200s budget.
+        return {
+            "list_id": "7916c4091b31",  # sha256 of the sorted test list
+            "enforced": enforced,
+            "td_enabled": True,
+            "run_all": False,
+            "selector_error": None,
+            "num_tests": 5,
+            "num_covered": 1,
+            "num_td_include": 2,
+            "num_hedged": 1,
+            "num_previous_failures_added": 1,
+            "kept_td": False,
+            "previous_failures_known": True,
+            "time_total": 1000,
+            "time_covered": 10,
+            "time_hedged": 170,
+            "time_previous_failures_added": 20,
+        }
+
+    def test_gate(self) -> None:
+        for td_enabled in (False, True):
+            for enforce in (False, True):
+                for pr_number in (None, 1):
+                    sel = Selection(files={"a"}, enforce=enforce)
+                    applied = self.apply(sel, td_enabled, pr_number)
+                    expected = td_enabled and enforce and pr_number is not None
+                    case = (td_enabled, enforce, pr_number)
+                    self.assertEqual(applied.enforced, expected, case)
+                    self.assertEqual(applied.selection_metric["enforced"], expected)
+                    self.assertFalse(applied.kept_td)
+                    # No previous failures is known, not unknown.
+                    self.assertTrue(applied.previous_failures_known)
+                    self.assertTrue(applied.failure_metric(TestRun("a"))["previous_failures_known"])  # fmt: skip
+
+    def test_not_enforced_measures_the_selection(self) -> None:
+        applied = self.apply(Selection(files={"a"}), prev={"p", "elsewhere"})
+        self.assertFalse(applied.enforced)
+        self.assertEqual(applied.td_include, {"p", "s"})
+        self.assertEqual(applied.selection_metric, self.metric(enforced=False))
+        self.assertEqual(
+            applied.failure_metric(TestRun("s")),
+            {
+                "failure": "s",
+                "covered": False,
+                "enforced": False,
+                "td_enabled": True,
+                "in_td_include": True,
+                "hedged": True,
+                "previous_failure_added": False,
+                "kept_td": False,
+                "previous_failures_known": True,
+                "selector_error": None,
+            },
+        )
+
+    def test_enforced_swaps_in_the_selection(self) -> None:
+        sel = Selection(files={"a"}, enforce=True)
+        applied = self.apply(sel, prev={"p", "elsewhere"})
+        self.assertEqual([str(x) for x in applied.split.include], ["p", "s", "a"])
+        self.assertEqual([str(x) for x in applied.split.exclude], ["big", "rest"])
+        self.assertEqual(applied.selection_metric, self.metric(enforced=True))
+
+    def test_enforced_log_line(self) -> None:
+        stderr = io.StringIO()
+        self.apply(Selection(files={"a"}, enforce=True), prev={"p"}, stderr=stderr)
+        self.assertEqual(
+            stderr.getvalue(),
+            "LLM selection: running 3 of 5 test files (1 covered; 1 previously failed; 1 hedged within 200s)\n",
+        )
+
+    def test_unknown_previous_failures_fall_back_to_td(self) -> None:
+        # td_results.json from a writer that does not store them.
+        stderr = io.StringIO()
+        sel = Selection(files={"a"}, enforce=True)
+        applied = self.apply(sel, prev=None, stderr=stderr)
+        self.assertFalse(applied.enforced)
+        self.assertEqual(
+            stderr.getvalue(),
+            "LLM selection: previous failures not recorded in the TD results, using TD\n",
+        )
+        # Without them p is hedged too, as the shadow metrics record.
+        unknown = {
+            "num_previous_failures_added": 0,
+            "time_previous_failures_added": 0,
+            "num_hedged": 2,
+            "time_hedged": 190,
+            "previous_failures_known": False,
+            "kept_td": True,
+        }
+        self.assertEqual(applied.selection_metric, self.metric(False) | unknown)
+        failure = applied.failure_metric(TestRun("p"))
+        keys = ("previous_failure_added", "kept_td", "previous_failures_known")
+        self.assertEqual([failure[k] for k in keys], [False, True, False])
+        shadow = self.apply(Selection(files={"a"}), prev=None)
+        self.assertEqual((shadow.enforced, shadow.kept_td), (False, False))
+
+    def test_no_test_times_falls_back_to_td(self) -> None:
+        stderr = io.StringIO()
+        sel = Selection(files={"a"}, enforce=True)
+        applied = self.apply(sel, times={}, stderr=stderr)
+        self.assertFalse(applied.enforced)
+        self.assertEqual(stderr.getvalue(), "LLM selection: no test times, using TD\n")
+        self.assertEqual(applied.selection_metric["time_total"], 0)
+        self.assertTrue(applied.kept_td)
+        # test-times.json is there but has none of the call's files.
+        applied = self.apply(sel, times={"elsewhere": 100.0})
+        self.assertEqual((applied.enforced, applied.kept_td), (False, True))
+
+    def test_nothing_chosen_is_reported_as_td(self) -> None:
+        # Neither scored file fits the 200s hedge and the selection names none.
+        stderr = io.StringIO()
+        times = {"p": 500.0, "s": 500.0}
+        applied = self.apply(Selection(enforce=True), times=times, stderr=stderr)
+        self.assertFalse(applied.enforced)
+        self.assertEqual(stderr.getvalue(), "LLM selection: chose no files, using TD\n")
+        self.assertTrue(applied.kept_td)
+        failure = applied.failure_metric(TestRun("p"))
+        self.assertEqual((failure["enforced"], failure["kept_td"]), (False, True))
+        self.assertFalse(self.apply(Selection(), times=times).kept_td)
+
+    def test_fallback_order(self) -> None:
+        # No test times, then unknown previous failures, then choosing nothing.
+        nothing = {"p": 500.0, "s": 500.0}
+        for sel, times, prev, reason in (
+            (Selection(files={"a"}, enforce=True), {}, None, "no test times"),
+            (Selection(enforce=True), {}, (), "no test times"),
+            (Selection(enforce=True), nothing, None, "previous failures not recorded in the TD results"),
+        ):  # fmt: skip
+            stderr = io.StringIO()
+            applied = self.apply(sel, prev=prev, times=times, stderr=stderr)
+            self.assertEqual((applied.enforced, applied.kept_td), (False, True))
+            self.assertEqual(stderr.getvalue(), f"LLM selection: {reason}, using TD\n")
+
+    def test_failure_metric(self) -> None:
+        # big failed before but TD does not run it and it does not fit the
+        # budget, so it does not run.
+        applied = self.apply(Selection(files={"a"}, enforce=True), prev={"p", "big"})
+        self.assertEqual([str(x) for x in applied.split.exclude], ["big", "rest"])
+        expected = {
+            "a": (True, False, False, False),
+            "p": (False, True, False, True),
+            "s": (False, True, True, False),
+            "big": (False, False, False, False),
+        }
+        for f, (covered, in_td, hedged, prev) in expected.items():
+            self.assertEqual(
+                applied.failure_metric(TestRun(f)),
+                {
+                    "failure": f,
+                    "covered": covered,
+                    "enforced": True,
+                    "td_enabled": True,
+                    "in_td_include": in_td,
+                    "hedged": hedged,
+                    "previous_failure_added": prev,
+                    "kept_td": False,
+                    "previous_failures_known": True,
+                    "selector_error": None,
+                },
+            )
+
+
+def import_test_dashboard() -> Any:
+    # upload_stats_lib imports boto3, which these tests never reach.
+    boto3 = sys.modules.get("boto3") or mock.MagicMock()
+    with mock.patch.dict(sys.modules, {"boto3": boto3}):
+        from tools.stats import test_dashboard
+    return test_dashboard
+
+
+class TestSplitTests(unittest.TestCase):
+    """run_test.py's wiring of the selection."""
+
+    def split_with(
+        self,
+        sel: Selection | None,
+        tp: TestPrioritizations | None = None,
+        times: dict[str, float] | None = None,
+        prev: Collection[str] | None = (),
+        td_enabled: bool = True,
+    ) -> tuple[selection.CallSplit, str]:
+        """split_tests' result and its stderr."""
+        tp = tp or TestPrioritizations(["a", "p"], {TestRun("p"): 1})
+        include, exclude = tp.get_top_per_tests(25)
+        stderr = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(selection, "get_pr_number", return_value=1),
+            mock.patch("sys.stderr", stderr),
+        ):
+            selection_file = Path(tmp) / "sel.json"
+            if sel is not None:
+                selection_file.write_text(json.dumps(sel.to_json()))
+            split = split_tests(
+                include,
+                exclude,
+                tp.get_score,
+                {"a": 1, "p": 1} if times is None else times,
+                selection_file=selection_file,
+                test_config="default",
+                td_enabled=td_enabled,
+                previously_failed=prev,
+            )
+        self.assertEqual((split.td_include, split.td_exclude), (include, exclude))
+        return split, stderr.getvalue()
+
+    def test_wiring(self) -> None:
+        enforced_sel = Selection(files={"a"}, enforce=True, candidates={"a"})
+        shadow_sel = Selection(files={"a"}, candidates={"a"})
+        for sel, enforced in ((None, False), (shadow_sel, False), (enforced_sel, True)):
+            split, stderr = self.split_with(sel)
+            self.assertEqual(split.enforced, enforced)
+            include = ["p", "a"] if enforced else ["p"]
+            self.assertEqual([str(x) for x in split.include], include)
+            self.assertEqual([str(x) for x in split.exclude], [] if enforced else ["a"])
+            self.assertEqual((split.llm is None), sel is None)
+            self.assertNotIn("::warning::", stderr)
+            self.assertEqual(split.source, "llm_selection" if enforced else "td")
+
+    def test_unknown_previous_failures_keep_td(self) -> None:
+        sel = Selection(files={"a"}, enforce=True, candidates={"a"})
+        split, stderr = self.split_with(sel, prev=None)
+        self.assertFalse(split.enforced)
+        self.assertEqual([str(x) for x in split.include], ["p"])
+        self.assertIn("previous failures not recorded", stderr)
+
+    def test_previous_failure_in_td_include_runs_when_enforced(self) -> None:
+        # TD ranks class A of f first and the rest of f last, and f is over
+        # the hedge budget, so only its previous failure runs it.
+        f_a = TestRun("f", included=["A"])
+        files = ["a", "f", "r1", "r2", "r3"]
+        tp = TestPrioritizations(files, {f_a: 1})
+        self.assertEqual([str(x) for x in tp.get_top_per_tests(25)[0]], ["f, A", "a"])
+        sel = Selection(files={"a"}, enforce=True, candidates=set(files))
+        times: dict[str, float] = {"a": 1, "f": 300, "r1": 233, "r2": 233, "r3": 233}
+        for prev, runs in (({"f"}, ["f, A", "a", "f, not (A)"]), (set(), ["a"])):
+            split, _ = self.split_with(sel, tp, times, prev)
+            self.assertTrue(split.enforced)
+            self.assertEqual([str(x) for x in split.include], runs)
+
+    def test_metrics_tell_a_failed_selector_from_a_run_all(self) -> None:
+        # select_tests clears enforce when the selector failed.
+        failed = Selection(run_all=True, reason="selector failed: x", error="x")
+        deliberate = Selection(run_all=True, reason="infra", enforce=True)
+        for sel, error, enforced in ((failed, "x", False), (deliberate, None, True)):
+            split, _ = self.split_with(sel)
+            if split.llm is None:
+                raise AssertionError("no selection read")
+            self.assertEqual(split.enforced, enforced)
+            self.assertEqual(split.llm.selection_metric["selector_error"], error)
+            failure = split.llm.failure_metric(TestRun("a"))
+            self.assertEqual(failure["selector_error"], error)
+
+    def test_td_disabled(self) -> None:
+        for sel in [None, Selection(files={"a"}, enforce=True, candidates={"a"})]:
+            split, _ = self.split_with(sel, td_enabled=False)
+            self.assertFalse(split.enforced)
+            self.assertEqual([str(x) for x in split.include], ["p"])
+
+    def test_run_test_main_wiring(self) -> None:
+        # main() passes TD's split and the PR's previous failures to
+        # split_tests, runs the split it returns, records it in TD's exclusions
+        # artifact in CI, prints TD's line only when the selection is not
+        # enforced, and emits the LLM metrics only when there is a selection.
+        # emit_metric records its caller's file, module and function, which
+        # queries of the metrics filter on, so they are emitted by main().
+        # Locals are matched by where they are bound, not by their names.
+        tree = ast.parse((REPO_ROOT / "test" / "run_test.py").read_text())
+        funcs = [f for f in tree.body if isinstance(f, ast.FunctionDef)]
+        (main,) = [f for f in funcs if f.name == "main"]
+        calls: dict[str, list[tuple[list[str], ast.Call]]] = {}
+        bound: dict[str, list[list[str]]] = {}
+        values: dict[str, list[str]] = {}
+
+        def visit(node: ast.AST, guards: list[str]) -> None:
+            for child in ast.iter_child_nodes(node):
+                inner = guards
+                if isinstance(node, ast.If) and child in node.body:
+                    inner = [*guards, ast.unparse(node.test)]
+                if isinstance(child, ast.Call):
+                    name = ast.unparse(child.func)
+                    first = child.args[0] if child.args else None
+                    if name in ("print_to_stderr", "emit_metric") and first:
+                        name = f"{name}({ast.unparse(first)})"
+                    calls.setdefault(name, []).append((inner, child))
+                if isinstance(child, ast.Assign) and len(child.targets) == 1:
+                    (target,) = child.targets
+                    elts = target.elts if isinstance(target, ast.Tuple) else [target]
+                    names = [ast.unparse(e) for e in elts]
+                    values.setdefault(names[0], []).append(ast.unparse(child.value))
+                    if isinstance(child.value, ast.Call):
+                        func = ast.unparse(child.value.func)
+                        bound.setdefault(func, []).append(names)
+                visit(child, inner)
+
+        def to_json_of(node: ast.expr) -> str:
+            """`node` as `[x.to_json() for x in <list>]`, unparsed to `<list>`."""
+            if not isinstance(node, ast.ListComp) or len(node.generators) != 1:
+                raise AssertionError(f"not a to_json list: {ast.unparse(node)}")
+            (gen,) = node.generators
+            self.assertEqual(ast.unparse(node.elt), f"{ast.unparse(gen.target)}.to_json()")  # fmt: skip
+            return ast.unparse(gen.iter)
+
+        visit(main, [])
+        ((tp, prev),) = bound["import_results"]
+        ((include, exclude),) = bound[f"{tp}.get_top_per_tests"]
+        ((file_times,),) = bound["load_test_file_times"]
+        ((split,),) = bound["split_tests"]
+        ((_, call),) = calls["split_tests"]
+        args = [ast.unparse(a) for a in call.args]
+        self.assertEqual(args, [include, exclude, f"{tp}.get_score", file_times])
+        kwargs = {str(k.arg): ast.unparse(k.value) for k in call.keywords}
+        selection_file = kwargs.pop("selection_file")
+        self.assertIn("LLM_TD_SELECTION_FILE", values.get(selection_file, [selection_file])[-1])  # fmt: skip
+        expected = {"test_config": "TEST_CONFIG", "td_enabled": "options.enable_td", "previously_failed": prev}  # fmt: skip
+        self.assertEqual(kwargs, expected)
+        global_metrics = [(ast.unparse(c.args[0]), g) for g, c in calls["add_global_metric"]]  # fmt: skip
+        self.assertIn(("'call_id'", []), global_metrics)
+        batches = [ast.unparse(c.args[1]) for _, c in calls["TestBatch"]]
+        self.assertEqual(batches, [f"{split}.include", f"{split}.exclude"])
+        ((guard, call),) = calls["gen_ci_artifact"]
+        self.assertEqual(guard, ["IS_CI"])
+        self.assertEqual([to_json_of(a) for a in call.args], [f"{split}.include", f"{split}.exclude"])  # fmt: skip
+        kwargs = {str(k.arg): k.value for k in call.keywords}
+        self.assertEqual(sorted(kwargs), ["source", "td_excluded"])
+        self.assertEqual(ast.unparse(kwargs["source"]), f"{split}.source")
+        self.assertEqual(to_json_of(kwargs["td_excluded"]), f"{split}.td_exclude")
+        td_line = [g for k, v in calls.items() if "based on TD" in k for g, _ in v]
+        self.assertEqual(td_line, [[f"not {split}.enforced"]])
+        llm_guard = ["IS_CI", f"{split}.llm is not None"]
+        ((guard, call),) = calls["emit_metric('llm_td_selection')"]
+        self.assertEqual(guard, llm_guard)
+        self.assertEqual(ast.unparse(call.args[1]), f"{split}.llm.selection_metric")
+        ((guard, call),) = calls["emit_metric('llm_td_failure')"]
+        self.assertEqual(guard, llm_guard)
+        failure = call.args[1]
+        if not isinstance(failure, ast.Call):
+            raise AssertionError(f"not a call: {ast.unparse(failure)}")
+        self.assertEqual(ast.unparse(failure.func), f"{split}.llm.failure_metric")
+        ((guard, call),) = calls["emit_metric('td_test_failure_stats_v2')"]
+        self.assertEqual(guard, ["IS_CI"])
+        fields = call.args[1]
+        if not isinstance(fields, ast.Dict):
+            raise AssertionError(f"not a dict: {ast.unparse(fields)}")
+        by_key = {ast.unparse(k): ast.unparse(v) for k, v in zip(fields.keys, fields.values) if k}  # fmt: skip
+        self.assertEqual(by_key["'llm_enforced'"], f"{split}.enforced")
+
+
+class TestDashboardExclusions(unittest.TestCase):
+    def exclusions(
+        self, artifacts: dict[str, dict], jobs: dict[str, str]
+    ) -> tuple[dict, list[str]]:
+        """get_td_exclusions over `artifacts`, and the artifacts whose jobs it looked up."""
+        test_dashboard = import_test_dashboard()
+        looked_up: list[str] = []
+
+        def unzip(_: object) -> None:
+            for name, content in artifacts.items():
+                Path(name).write_text(json.dumps(content))
+
+        def get_job_name(path: Path) -> str:
+            looked_up.append(path.name)
+            return jobs.get(path.name, "linux / test (default, 1, 2, x)")
+
+        cwd = os.getcwd()
+        try:
+            with mock.patch.multiple(
+                test_dashboard,
+                download_s3_artifacts=mock.Mock(return_value=["x"]),
+                unzip=unzip,
+                get_job_id=lambda path: path,
+                get_job_name=get_job_name,
+            ):
+                exclusions = test_dashboard.get_td_exclusions(1, 1)
+        finally:
+            os.chdir(cwd)
+        return json.loads(json.dumps(exclusions)), sorted(looked_up)
+
+    def test_exclusions_are_grouped_by_source(self) -> None:
+        llm = gen_artifact.LLM_SELECTION_SOURCE
+        with tempfile.TemporaryDirectory() as d:
+            reports = Path(d) / "test" / "test-reports"
+            reports.mkdir(parents=True)
+            with mock.patch.object(gen_artifact, "REPO_ROOT", Path(d)):
+                excluded = [{"test_file": "c"}]
+                td_excluded = [{"test_file": "d"}]
+                gen_artifact.gen_ci_artifact(
+                    [], excluded, source=llm, td_excluded=td_excluded
+                )
+            (written,) = reports.glob("td_exclusions-*.json")
+            llm_artifact = json.loads(written.read_text())
+
+        b = [{"test_file": "b"}]
+        artifacts = {
+            "td_exclusions-1.json": {"included": [], "excluded": [{"test_file": "a"}]},
+            "td_exclusions-2.json": {"included": [{"test_file": "c"}], "excluded": b, "source": "td"},
+            "td_exclusions-3.json": llm_artifact,
+            # An enforced call that excluded nothing.
+            "td_exclusions-4.json": {**llm_artifact, "excluded": [], "td_excluded": []},
+            "td_exclusions-5.json": {"included": [], "excluded": [], "source": "td"},
+            # A call that excluded nothing but ran a file another call excluded.
+            "td_exclusions-6.json": {"included": [{"test_file": "a"}], "excluded": [], "source": "td"},
+        }  # fmt: skip
+        jobs = {
+            "td_exclusions-4.json": "linux / test (slow, 1, 1, x)",
+            "td_exclusions-5.json": "linux / test (crossref, 1, 1, x)",
+        }
+        exclusions, _ = self.exclusions(artifacts, jobs)
+        self.assertEqual(
+            exclusions,
+            {
+                "td": {"linux": {"default": ["a", "b", "d"]}},
+                # What a config with an enforced call excluded and none of its calls ran.
+                "llm_selection": {"linux": {"default": ["b"], "slow": []}},
+            },
+        )
+        # Without an enforced call, the calls that excluded nothing are not
+        # looked up, and an artifact without a source is TD's.
+        td_only = {k: artifacts[k] for k in (f"td_exclusions-{i}.json" for i in (1, 2, 5, 6))}  # fmt: skip
+        exclusions, looked_up = self.exclusions(td_only, jobs)
+        self.assertEqual(exclusions, {"td": {"linux": {"default": ["a", "b"]}}})
+        self.assertEqual(looked_up, ["td_exclusions-1.json", "td_exclusions-2.json"])
+
+    def test_a_file_split_by_class_ran_only_if_it_ran_whole(self) -> None:
+        llm = gen_artifact.LLM_SELECTION_SOURCE
+        a_in, a_out = {"test_file": "a", "included": ["A"]}, {"test_file": "a", "excluded": ["A"]}  # fmt: skip
+        b_in, b_out = {"test_file": "b", "included": ["B"]}, {"test_file": "b", "excluded": ["B"]}  # fmt: skip
+        artifacts = {
+            "td_exclusions-1.json": {"included": [a_in, b_in], "excluded": [a_out, b_out], "source": llm},
+            "td_exclusions-2.json": {"included": [{"test_file": "b"}], "excluded": [], "source": "td"},
+        }  # fmt: skip
+        exclusions, _ = self.exclusions(artifacts, {})
+        self.assertEqual(exclusions["llm_selection"], {"linux": {"default": ["a"]}})
+
+    def test_both_sources_are_uploaded(self) -> None:
+        dash = import_test_dashboard()
+        td, llm = {"linux": {"default": ["a"]}}, {"linux": {"default": ["c"]}}
+        for exclusions, expected in (
+            ({}, [mock.call(1, 2, "additional_info/td_exclusions", [{}])]),
+            ({"td": td}, [mock.call(1, 2, "additional_info/td_exclusions", [td])]),
+            (
+                {"td": td, "llm_selection": llm},
+                [
+                    mock.call(1, 2, "additional_info/td_exclusions", [td]),
+                    mock.call(1, 2, "additional_info/llm_td_exclusions", [llm]),
+                ],
+            ),
+        ):
+            with (
+                mock.patch.object(dash, "get_td_exclusions", return_value=exclusions),
+                mock.patch.object(dash, "upload_workflow_stats_to_s3") as upload,
+            ):
+                dash.upload_additional_info(1, 2)
+            self.assertEqual(upload.call_args_list, expected)
+
+
 class TestPrompt(unittest.TestCase):
     def test_truncate_diff_keeps_every_file(self) -> None:
         diff = "\n".join(
@@ -523,7 +1305,7 @@ class TestMain(unittest.TestCase):
         with mock.patch.object(select_tests, "git", side_effect=error):
             record = self.run_main("--enforce")
         self.assertTrue(record["run_all"])
-        self.assertTrue(record["enforce"])
+        self.assertFalse(record["enforce"])
         self.assertIn("selector failed", record["reason"])
         self.assertIn("CalledProcessError", record["error"])
         self.assertNotIn("error", record["diagnostics"])
@@ -622,6 +1404,39 @@ class TestMain(unittest.TestCase):
         times.assert_not_called()
         self.assertTrue(record["run_all"])
         self.assertIsNone(record["error"])
+
+    def test_only_a_deliberate_run_all_is_enforced(self) -> None:
+        def run(changed: str, answer: dict, times: dict, *argv: str) -> dict:
+            with tempfile.TemporaryDirectory() as tmp, clean_env():
+                output = Path(tmp) / "out.json"
+                with (
+                    mock.patch.object(select_tests, "git", return_value=changed),
+                    mock.patch.object(
+                        select_tests, "get_test_times", return_value=times
+                    ),
+                    mock.patch.object(select_tests, "query_model", return_value=answer),
+                ):
+                    select_tests.main(["--title", "t", "--output", str(output), *argv])
+                return json.loads(output.read_text())
+
+        times = {"env": {"default": {"test_nn": 1.0}}}
+        model_run_all = {"structured_output": {"run_all": True, "reason": "", "sweeps": [], "dirs": [], "tests": []}}  # fmt: skip
+        normal = {"structured_output": {"run_all": False, "reason": "", "sweeps": [], "dirs": [], "tests": [{"file": "test_nn", "confidence": "high"}]}}  # fmt: skip
+        error = {"is_error": True, "result": "overloaded"}
+        malformed = {"structured_output": {"run_all": False, "tests": "test_nn"}}
+        for changed, answer, t, enforced, argv in [
+            ("test/run_test.py\n", error, times, True, ["--enforce"]),
+            ("docs/a.md\n", model_run_all, times, True, ["--enforce"]),
+            ("docs/a.md\n", normal, times, True, ["--enforce"]),
+            ("docs/a.md\n", normal, times, False, []),
+            ("docs/a.md\n", error, times, False, ["--enforce"]),
+            ("docs/a.md\n", malformed, times, False, ["--enforce"]),
+            ("docs/a.md\n", model_run_all, {}, False, ["--enforce"]),
+            ("", model_run_all, times, True, ["--enforce"]),
+        ]:
+            record = run(changed, answer, t, *argv)
+            self.assertEqual(record["run_all"], answer is not normal)
+            self.assertEqual(record["enforce"], enforced, (changed, answer, t, argv))
 
     def run_in_repo(self, answer: dict) -> tuple[dict, str]:
         env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "LLM_TD_", "CLAUDE_CODE_"))}  # fmt: skip
