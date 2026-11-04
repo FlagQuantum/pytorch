@@ -222,9 +222,9 @@ def refuse_unsafe_env_keys(
     `python3` itself for every step in scope — bash imports exported functions
     from the environment — and it is on nobody's list of dangerous variables.
     So the rule is inverted, as `refuse_unmodelled_spellings` already does for
-    grammar: a name must be plain `SCREAMING_SNAKE`,
-    which `BASH_FUNC_python3%%` is not, and must not be one of the startup
-    variables, which are the legal-looking names that still execute code.
+    grammar: a name must be plain `SCREAMING_SNAKE`, which `BASH_FUNC_python3%%`
+    is not, and must not be one of the startup variables, which are the
+    legal-looking names that still execute code.
 
     AND `env:` MUST BE A BLOCK. `env: {SHELLOPTS: noexec}` is a legal flow
     mapping that `indented_blocks` skips entirely — it yields no lines, so a
@@ -2310,11 +2310,11 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         A BASE CASE, because a `__main__` that builds the suite some other way
         (a spawned `unittest discover`, or `loadTestsFromModule` in this
         module) bypasses the swap and reaches this test inside the child. The
-        children carry a
-        marker, and this test fails rather than spawns when it sees one. It
-        fails, not skips, so a marker leaked into a real run shows red. A
-        TIMEOUT as well, shared by all six children, for an entry point that
-        hangs. The children run sentinels only, so a short bound is enough.
+        children carry a marker, and this test fails rather than spawns when
+        it sees one. It fails, not skips, so a marker leaked into a real run
+        shows red. A TIMEOUT as well, shared by all six children, for an entry
+        point that hangs. The children run sentinels only, so a short bound is
+        enough.
         """
         if os.environ.get(REENTRY_MARKER):
             self.fail(
@@ -2417,6 +2417,9 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                             timeout=max(0, deadline - time.monotonic())
                         )
                     except subprocess.TimeoutExpired:
+                        # A child that already exited is judged on its own
+                        # result below, even when an earlier module used up
+                        # the deadline.
                         hung = child.poll() is None
                         kill_tree(child)
                         try:
@@ -2428,12 +2431,10 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                             err = (
                                 partial + "\n(a process outside its group holds stderr)"
                             )
-                        failures[name] = err[-1500:] + (
-                            "\ntimed out: the entry point hung"
-                            if hung
-                            else "\ntimed out: it exited, but left a process holding stderr"
-                        )
-                        continue
+                            hung = True
+                        if hung:
+                            failures[name] = err[-1500:] + "\ntimed out"
+                            continue
                     if child.returncode != 0:
                         failures[name] = err[-1500:]
                     elif "ENTRY_POINT_OK" not in err:
