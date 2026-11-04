@@ -2308,8 +2308,9 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         hand every one to the runner.
 
         A BASE CASE, because a `__main__` that builds the suite some other way
-        (`loadTestsFromModule`, a spawned `unittest discover`) bypasses the
-        swap and reaches this test inside the child. The children carry a
+        (a spawned `unittest discover`, or `loadTestsFromModule` in this
+        module) bypasses the swap and reaches this test inside the child. The
+        children carry a
         marker, and this test fails rather than spawns when it sees one. It
         fails, not skips, so a marker leaked into a real run shows red. A
         TIMEOUT as well, shared by all six children, for an entry point that
@@ -2317,8 +2318,9 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         """
         if os.environ.get(REENTRY_MARKER):
             self.fail(
-                f"{REENTRY_MARKER} is set: an entry point ran the real suite "
-                "instead of the sentinels, so this test reached itself"
+                f"{REENTRY_MARKER} is set: either an entry point ran the real "
+                "suite instead of the sentinels, or the variable leaked into "
+                "this run's environment"
             )
         program = textwrap.dedent(
             """
@@ -2327,31 +2329,47 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
             sys.argv = [path]  # started with no arguments
             sys.path.insert(0, path.rsplit("/", 1)[0])  # what script start does
             real_discover = unittest.TestLoader.discover
-            seen = {"found": None, "ran": 0}
+            seen = {"found": None, "ran": []}
+            def flatten(suite):
+                for test in suite:
+                    if isinstance(test, unittest.TestSuite):
+                        yield from flatten(test)
+                    else:
+                        yield test
             class Sentinel(unittest.TestCase):
+                # Carries the real test's id, so a runner that filters or
+                # repeats tests by id changes what is recorded below.
+                def __init__(self, test_id):
+                    super().__init__("test_ran")
+                    self.test_id = test_id
+                def id(self):
+                    return self.test_id
+                def __str__(self):
+                    return self.test_id
                 def test_ran(self):
-                    seen["ran"] += 1
-            def count_then_swap(loader, *args, **kwargs):
+                    seen["ran"].append(self.test_id)
+            def swap(loader, *args, **kwargs):
                 found = real_discover(loader, *args, **kwargs)
-                seen["found"] = found.countTestCases()
+                seen["found"] = sorted(test.id() for test in flatten(found))
                 for error in loader.errors:
                     print(error, file=sys.stderr)
-                return unittest.TestSuite(
-                    Sentinel("test_ran") for _ in range(seen["found"])
-                )
-            unittest.TestLoader.discover = count_then_swap
+                return unittest.TestSuite(Sentinel(i) for i in seen["found"])
+            unittest.TestLoader.discover = swap
             unittest.main = lambda *a, **k: sys.exit("unittest.main() was called")
             code = "returned without exiting"
             try:
                 runpy.run_path(path, run_name="__main__")
             except SystemExit as e:
                 code = e.code
-            if code != 0:
+            if code not in (0, None):
                 sys.exit(f"exit {code}")
-            if seen["found"] != expected or seen["ran"] != expected:
+            found, ran = seen["found"] or [], sorted(seen["ran"])
+            if len(found) != expected or ran != found:
+                missing = sorted(set(found) - set(ran))[:5]
                 sys.exit(
-                    f"found {seen['found']} tests and ran {seen['ran']}; "
-                    f"discovery from the repository finds {expected}"
+                    f"found {len(found)} tests and ran {len(ran)} "
+                    f"(not run, first 5: {missing}); discovery from the "
+                    f"repository finds {expected}"
                 )
             print("ENTRY_POINT_OK", file=sys.stderr)
             """
@@ -2400,12 +2418,15 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                             timeout=max(0, deadline - time.monotonic())
                         )
                     except subprocess.TimeoutExpired:
-                        kill_tree(child)
+                        hung = child.poll() is None
+                        if hung:
+                            kill_tree(child)
                         try:
                             _, err = child.communicate(timeout=10)
                         except subprocess.TimeoutExpired:
                             err = "(a descendant outside its group holds stderr)"
-                        err += "\ntimed out: the entry point hung"
+                        if hung:
+                            err += "\ntimed out: the entry point hung"
                     if child.returncode != 0:
                         failures[name] = err[-1500:]
                     elif "ENTRY_POINT_OK" not in err:
@@ -2419,8 +2440,7 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                         child.wait()
         if failures:
             self.fail(
-                "`python3 scripts/pr_review/<module>` does not find and run the "
-                "whole suite for: "
+                "`python3 scripts/pr_review/<module>` fails for: "
                 + ", ".join(failures)
                 + "".join(f"\n\n--- {name}:\n{err}" for name, err in failures.items())
             )
@@ -2962,7 +2982,7 @@ class TestNoWorkflowSetsAnUnmodelledEnvironmentName(unittest.TestCase):
                 )
 
     def test_all_three_workflows_are_written_in_the_readable_subset(self):
-        """The only grammar check, on all three workflows.
+        """The only whole-file grammar check, on all three workflows.
 
         Four defects were all one shape — a flow mapping or a bare list marker
         somewhere no line-oriented reader models — and every one was in a file
@@ -4034,9 +4054,9 @@ class TestStage1RunsNoPullRequestContent(unittest.TestCase):
         a comment at all. A body containing a newline then contributes a line
         bash executes. Measured: all 328 tests green.
 
-        Read from RAW, therefore, and refuse the construct on every line,
-        comment or not: this is the only `${{` check on Stage 1's `run:`
-        bodies. Stage 1 passes everything it needs through `env:`.
+        Read from RAW, therefore, and refuse `${{` in `run:` bodies outright,
+        comment lines included; the allowlist test reads only uncommented
+        text. Stage 1 passes everything it needs through `env:`.
         """
         # From the RAW capture job, entry by entry. `block_scalars` matches only
         # at the OUTERMOST key indent of the text it is given, so handing it the
