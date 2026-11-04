@@ -14,4 +14,6 @@ string(REPLACE "." ";" __cuda_ver_parts "${CUDAToolkit_VERSION}")
 list(GET __cuda_ver_parts 0 CUDA_MAJOR)
 list(GET __cuda_ver_parts 1 CUDA_MINOR)
 
+# The updated EP layout moved this generated header under nccl_ep/.
+file(REMOVE "${NCCL_EP_BUILDDIR}/include/ep_enums.h")
 add_subdirectory("${NCCL_EP_SOURCE_DIR}" nccl_ep)
