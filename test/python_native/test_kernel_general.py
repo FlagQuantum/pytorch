@@ -244,6 +244,17 @@ class TestKernelGeneral(TestCase):
         )
         self.assertEqual(out, 1)
 
+    def test_float64_norm2_tree_leaves(self):
+        """Square float64 norm2 tree leaves with the float64 rounded multiply."""
+        x = torch.randn(64, 2000, device="cuda", dtype=torch.float64)
+        trait = T.NormOps(2, acc=cutlass.Float64)
+        # Contiguous rows take the row tree; strided rows take the indexed tree.
+        for view in (x, x[:, ::2]):
+            got = kg.reduce_dim(
+                trait, "norm2_f64", view, [1], torch.float64, order="inner_tree"
+            )
+            self.assertEqual(got, torch.linalg.vector_norm(view, dim=1))
+
     def test_empty_inner_tree_reduce_all(self):
         """Use the reduction identity when an empty input has no tree order."""
         x = torch.empty(0, device="cuda")
@@ -286,7 +297,8 @@ class TestKernelGeneral(TestCase):
 
     def test_family_kernels_are_listed(self):
         # New kernels must be listed here deliberately: TileReduce is the shared body for every
-        # axis and PartialColumns folds partition-major column partials. Glob files and match
+        # axis, PartialColumns folds partition-major column partials, and _OrderedColReduce
+        # preserves the row inner-tree order down columns. Glob files and match
         # qualified or annotated decorators so new drivers and spellings cannot evade the check.
         # Runtime introspection cannot distinguish @cute.kernel from @cute.jit wrappers.
         root = pathlib.Path(reductions.__file__).parent
@@ -297,7 +309,7 @@ class TestKernelGeneral(TestCase):
             for line in path.read_text().splitlines()
             if deco.match(line.strip())
         )
-        self.assertEqual(found, {"tile.py": 1, "kernel_coltile.py": 1})
+        self.assertEqual(found, {"tile.py": 1, "kernel_coltile.py": 2})
 
     def test_internal_invariants_raise(self):
         # Each invariant must raise explicitly because python -O strips asserts. Exercise every
