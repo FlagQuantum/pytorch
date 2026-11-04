@@ -44,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -72,6 +73,9 @@ STAGE2 = WORKFLOWS / "hardened-pr-review-run.yml"
 SUITE_CI = WORKFLOWS / "pr-review-scripts-test.yml"
 # The guard module itself, copied into a synthesized tree by the preflight test.
 HERE_MANIFEST = Path(__file__).resolve().parent / "_suite_manifest.py"
+# Set by `test_every_module_entry_point_finds_and_runs_this_suite` in the
+# children it spawns; that test fails instead of spawning when it sees it.
+REENTRY_MARKER = "PR_REVIEW_ENTRY_POINT_CHILD"
 PR_REVIEW_SKILL = REPO / ".agents" / "skills" / "pr-review" / "SKILL.md"
 # THE skills stage A installs and may read: pr-review, and the sibling skills
 # installed beside it, which an installed skill may refer to as `../<name>/`.
@@ -274,8 +278,8 @@ def refuse_unsafe_env_keys(
             # job holding the AWS session; `GIT_CONFIG_GLOBAL: pr/.gitconfig`
             # gives the job's `git` a PR-authored `diff.external`; `LD_PRELOAD`
             # is the classic. All three are plain SCREAMING_SNAKE and on
-            # nobody's denylist, which is why Stage 1 has had an allowlist
-            # since round 5 and this is now the same rule for the other two.
+            # nobody's denylist, which is why all three workflows are held to
+            # an allowlist here.
             case.assertIn(
                 name,
                 allowed,
@@ -970,8 +974,8 @@ def refuse_unmodelled_spellings(case: unittest.TestCase, text: str, what: str) -
     Run on all three workflows by
     `test_all_three_workflows_are_written_in_the_readable_subset`. A flow
     mapping or a bare list marker is the shape of four separate defects found
-    in files that had no grammar, and none in the one that did. A grammar on
-    one of three files is not a grammar.
+    in files that had no grammar, and none in Stage 1, which had one. A grammar
+    on one of three files is not a grammar.
     """
     lines = text.split("\n")
     i = 0
@@ -2303,11 +2307,19 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         executes every test, so each entry point only has to find them all and
         hand every one to the runner.
 
-        A TIMEOUT, because a `__main__` that builds the suite some other way
+        A BASE CASE, because a `__main__` that builds the suite some other way
         (`loadTestsFromModule`, a spawned `unittest discover`) bypasses the
-        swap, reaches this test inside the child and recurses. The children run
-        sentinels only, so a short bound is enough.
+        swap and reaches this test inside the child. The children carry a
+        marker, and this test fails rather than spawns when it sees one. It
+        fails, not skips, so a marker leaked into a real run shows red. A
+        TIMEOUT as well, shared by all six children, for an entry point that
+        hangs. The children run sentinels only, so a short bound is enough.
         """
+        if os.environ.get(REENTRY_MARKER):
+            self.fail(
+                f"{REENTRY_MARKER} is set: an entry point ran the real suite "
+                "instead of the sentinels, so this test reached itself"
+            )
         program = textwrap.dedent(
             """
             import runpy, sys, unittest
@@ -2341,6 +2353,7 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                     f"found {seen['found']} tests and ran {seen['ran']}; "
                     f"discovery from the repository finds {expected}"
                 )
+            print("ENTRY_POINT_OK", file=sys.stderr)
             """
         )
         expected = (
@@ -2350,8 +2363,9 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         )
 
         # Each child leads its own process group, so a timeout kills whatever
-        # it spawned too; otherwise a grandchild holding stderr open keeps the
-        # drain below waiting after the child itself is dead.
+        # it spawned too, unless that started a session of its own. Otherwise
+        # a grandchild holding stderr open keeps the drain below waiting after
+        # the child itself is dead.
         def kill_tree(child):
             try:
                 os.killpg(child.pid, signal.SIGKILL)
@@ -2371,21 +2385,33 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                             str(expected),
                         ],
                         cwd=td,
+                        env={**os.environ, REENTRY_MARKER: "1"},
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
                         text=True,
                         start_new_session=True,
                     )
+                # One deadline for all six: CI gives the whole job 5 minutes.
+                deadline = time.monotonic() + 120
                 failures = {}
                 for name, child in children.items():
                     try:
-                        _, err = child.communicate(timeout=120)
+                        _, err = child.communicate(
+                            timeout=max(0, deadline - time.monotonic())
+                        )
                     except subprocess.TimeoutExpired:
                         kill_tree(child)
-                        _, err = child.communicate(timeout=10)
-                        err += "\ntimed out: the entry point recursed or hung"
+                        try:
+                            _, err = child.communicate(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            err = "(a descendant outside its group holds stderr)"
+                        err += "\ntimed out: the entry point hung"
                     if child.returncode != 0:
                         failures[name] = err[-1500:]
+                    elif "ENTRY_POINT_OK" not in err:
+                        failures[name] = (
+                            err[-1500:] + "\nexited 0 before the count check"
+                        )
             finally:
                 for child in children.values():
                     if child.poll() is None:
@@ -2941,8 +2967,8 @@ class TestNoWorkflowSetsAnUnmodelledEnvironmentName(unittest.TestCase):
         Four defects were all one shape — a flow mapping or a bare list marker
         somewhere no line-oriented reader models — and every one was in a file
         without a grammar. A grammar on one of three files is not a grammar, so
-        it is applied to all three here. Comments are stripped first: Actions
-        never reads them.
+        it is applied to all three here. Comments are stripped first: YAML
+        comments carry no structure.
         """
         for path in (STAGE1, STAGE2, SUITE_CI):
             with self.subTest(workflow=path.name):
@@ -3203,8 +3229,8 @@ class TestEveryStageTwoJobChecksOutWhatItsRoleAllows(unittest.TestCase):
         )
 
     def test_neither_stage_declares_a_workflow_level_collapse_group(self):
-        """The defect TestStage1CollapseGroupIsJobLevel exists for, on the
-        OTHER file, where it is worse.
+        """The defect TestStage1CollapseGroupIsJobLevel exists for, on both
+        files; it is worse on Stage 2.
 
         GitHub claims a workflow-level group before evaluating a job's `if:`,
         so a run the workflow is going to skip still joins it. Stage 2 receives
@@ -4002,15 +4028,15 @@ class TestStage1RunsNoPullRequestContent(unittest.TestCase):
         Every other reader in this class works on `strip_comments(self.raw)`,
         which drops whole-line `#` comments — including comments inside a
         `run:` body. So `# PR context: ${{ github.event.pull_request.body }}`
-        added to the capture script was invisible to the expression scan AND
+        added to the capture script was invisible to those readers AND
         left the pinned digest unchanged, while the runner substituted a
         multi-line, attacker-authored body into the script text before bash saw
         a comment at all. A body containing a newline then contributes a line
         bash executes. Measured: all 328 tests green.
 
-        Read from RAW, therefore, and refuse the construct outright — Stage 1
-        passes everything it needs through `env:`, which is the rule the rest of
-        this class already enforces for non-comment lines.
+        Read from RAW, therefore, and refuse the construct on every line,
+        comment or not: this is the only `${{` check on Stage 1's `run:`
+        bodies. Stage 1 passes everything it needs through `env:`.
         """
         # From the RAW capture job, entry by entry. `block_scalars` matches only
         # at the OUTERMOST key indent of the text it is given, so handing it the
