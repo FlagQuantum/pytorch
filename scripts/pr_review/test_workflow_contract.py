@@ -1969,9 +1969,7 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         self.assertTrue(step.strip(), "the preflight step is gone")
         return textwrap.dedent(scalar_block(step, "run"))
 
-    def _run_preflight(
-        self, *, hook: bool = False, delete: tuple[str, ...] = ()
-    ) -> int:
+    def _run_preflight(self, *, hook: str = "", delete: tuple[str, ...] = ()) -> int:
         """RUN it against a synthesized tree. Returns the exit status.
 
         A real subtree rather than the repository's own: the two rejections are
@@ -1982,9 +1980,7 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
             pkg = Path(td) / "scripts" / "pr_review"
             pkg.mkdir(parents=True)
             (pkg.parent / "__init__.py").write_text("")
-            (pkg / "__init__.py").write_text(
-                "def load_tests(*a, **k):\n    return None\n" if hook else ""
-            )
+            (pkg / "__init__.py").write_text(hook)
             shutil.copy(HERE_MANIFEST, pkg / HERE_MANIFEST.name)
             for name in EXPECTED_MODULES:
                 if name not in delete:
@@ -2031,13 +2027,20 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         suite can be relied on to fail it.
         """
         self.assertEqual(self._run_preflight(), 0, "the preflight rejects a good tree")
-        self.assertNotEqual(
-            self._run_preflight(hook=True),
-            0,
-            "a `load_tests` hook on scripts/pr_review/__init__.py is accepted; "
-            "it suppresses discovery of the whole suite before one test is "
-            "collected, and nothing inside the suite can see that.",
-        )
+        # Two spellings, so a text match on `def load_tests` cannot pass.
+        for hook in (
+            "def load_tests(*a, **k):\n    return None\n",
+            "load_tests = lambda *a, **k: None\n",
+        ):
+            with self.subTest(hook=hook):
+                self.assertNotEqual(
+                    self._run_preflight(hook=hook),
+                    0,
+                    "a `load_tests` hook on scripts/pr_review/__init__.py is "
+                    "accepted; it suppresses discovery of the whole suite before "
+                    "one test is collected, and nothing inside the suite can see "
+                    "that.",
+                )
         for name in sorted(EXPECTED_MODULES):
             with self.subTest(deleted=name):
                 self.assertNotEqual(
@@ -2437,6 +2440,13 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                             continue
                     if child.returncode != 0:
                         failures[name] = err[-1500:]
+                    elif not (
+                        re.search(rf"(?m)^Ran {expected} tests in ", err)
+                        and re.search(r"(?m)^OK\b", err)
+                    ):
+                        failures[name] = (
+                            err[-1500:] + "\nthe runner's report never reached stderr"
+                        )
                     elif "ENTRY_POINT_OK" not in err:
                         failures[name] = (
                             err[-1500:] + "\nexited 0 before the count check"
