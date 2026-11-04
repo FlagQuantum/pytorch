@@ -2356,13 +2356,12 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                 return unittest.TestSuite(Sentinel(i) for i in seen["found"])
             unittest.TestLoader.discover = swap
             unittest.main = lambda *a, **k: sys.exit("unittest.main() was called")
-            code = "returned without exiting"
             try:
                 runpy.run_path(path, run_name="__main__")
+                sys.exit("returned without exiting")
             except SystemExit as e:
-                code = e.code
-            if code not in (0, None):
-                sys.exit(f"exit {code}")
+                if e.code not in (0, None):
+                    sys.exit(e.code if isinstance(e.code, str) else f"exit {e.code}")
             found, ran = seen["found"] or [], sorted(seen["ran"])
             if len(found) != expected or ran != found:
                 missing = sorted(set(found) - set(ran))[:5]
@@ -2387,7 +2386,7 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         def kill_tree(child):
             try:
                 os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
 
         with tempfile.TemporaryDirectory() as td:
@@ -2419,14 +2418,22 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                         )
                     except subprocess.TimeoutExpired:
                         hung = child.poll() is None
-                        if hung:
-                            kill_tree(child)
+                        kill_tree(child)
                         try:
                             _, err = child.communicate(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            err = "(a descendant outside its group holds stderr)"
-                        if hung:
-                            err += "\ntimed out: the entry point hung"
+                        except subprocess.TimeoutExpired as e:
+                            partial = e.stderr or ""
+                            if isinstance(partial, bytes):
+                                partial = partial.decode(errors="replace")
+                            err = (
+                                partial + "\n(a process outside its group holds stderr)"
+                            )
+                        failures[name] = err[-1500:] + (
+                            "\ntimed out: the entry point hung"
+                            if hung
+                            else "\ntimed out: it exited, but left a process holding stderr"
+                        )
+                        continue
                     if child.returncode != 0:
                         failures[name] = err[-1500:]
                     elif "ENTRY_POINT_OK" not in err:
@@ -2435,8 +2442,8 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
                         )
             finally:
                 for child in children.values():
+                    kill_tree(child)
                     if child.poll() is None:
-                        kill_tree(child)
                         child.wait()
         if failures:
             self.fail(
@@ -5125,6 +5132,11 @@ class TestSymlinkScrubIsNulSafe(unittest.TestCase):
             "directory the PR did not write while the PR tree keeps its "
             "escaping symlinks.",
         )
+
+    def test_the_list_is_never_joined_with_newlines(self):
+        self.assertNotIn("printf '%s\\n' \"$ESCAPED\"", self.scrub)
+        self.assertNotIn("ESCAPED=$(", self.scrub)
+        self.assertNotIn("LEFT=$(", self.scrub)
 
     def test_both_the_delete_and_the_rescan_read_nul_separated(self):
         self.assertEqual(self.scrub.count("printf '%s\\0'"), 1)
